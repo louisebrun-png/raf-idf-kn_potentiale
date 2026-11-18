@@ -98,6 +98,14 @@ def norm_client_code(val):
     s = re.sub(r'^TO_', '', s)
     return s
 
+def extract_code_digits(val):
+    """Extrait la séquence numérique significative (>= 4 chiffres) d'un code client ou SSC (ex: OO100383 ou AFIDF-OO100383 -> 100383)."""
+    s = norm_client_code(val)
+    if not s:
+        return ''
+    nums = re.findall(r'\d{4,}', s)
+    return nums[-1] if nums else ''
+
 def extract_code_root(val):
     """Extrait le radical client (6 premiers caractères alphanumériques) pour les comptes multi-sites."""
     s = re.sub(r'[^A-Z0-9]', '', norm_client_code(val))
@@ -352,7 +360,7 @@ with st.sidebar:
 st.markdown("# 💼 Potentiale — Outil Métier RAF (Rapprochement Abonnements Fournisseurs)")
 st.markdown(
     "**Urbanisation SI & Pilotage Budgétaire** | Audit Fiscal TVA [STD Standard 20%], "
-    "Contrôle Seuil Groupe 3 % par Facture, Réconciliation 8 Passes & Tri Anomalies en Tête"
+    "Contrôle Seuil Groupe 3 % par Facture, Correspondance Partielle Codes Clients & Tri Anomalies en Tête"
 )
 
 with st.expander("📌 Correspondance Dépôts ERP = Factures Fournisseur (Règle d'Urbanisation Potentiale)", expanded=True):
@@ -529,10 +537,15 @@ if file_sim and file_ssc and files_csv:
         sim_err_date = sim_all_rec[sim_all_rec['Statut_Temporel'] == 'Erreur Date Dernier Achat (< M-1)'].copy()
         sim_rec = sim_all_rec[sim_all_rec['Statut_Temporel'] != 'Erreur Date Dernier Achat (< M-1)'].copy()
 
-        # --- 5. MOTEUR DE RÉCONCILIATION EN 8 PASSES ---
+        # --- 5. MOTEUR DE RÉCONCILIATION EN 8 PASSES (AVEC RADICAL NUMÉRIQUE CODE CLIENT / SSC) ---
         sim_rec['Tech_ID'] = sim_rec.apply(get_erp_tech_id, axis=1)
         sim_rec['Sub_Client_Code'] = sim_rec['Tech_ID'].apply(norm_client_code)
         sim_rec['Code_Client_ERP_Norm'] = sim_rec['Code client'].apply(norm_client_code)
+        # Extraction de la partie numérique (>= 4 chiffres) du Code Client ou du Numéro SSC (ex: OO100383 / AFIDF-OO100383 -> 100383)
+        sim_rec['Code_Digits_ERP'] = sim_rec.apply(
+            lambda r: extract_code_digits(r['Code client']) or extract_code_digits(r['Code SSC']),
+            axis=1
+        )
         sim_rec['Code_Root_ERP'] = sim_rec['Code client'].apply(extract_code_root)
         sim_rec['Art_Num'] = sim_rec['Code Article'].apply(extract_art_num)
         sim_rec['Prod_Lib'] = sim_rec['Libellé RFC'].apply(lambda s: str(s).split('//')[0].strip())
@@ -542,6 +555,7 @@ if file_sim and file_ssc and files_csv:
 
         f_abo['Tech_ID'] = f_abo['Matricule fournisseur'].fillna('').astype(str).str.replace('.0', '', regex=False).str.strip()
         f_abo['Code_Client_Fourn_Norm'] = f_abo['Ref. client'].apply(norm_client_code)
+        f_abo['Code_Digits_Fourn'] = f_abo['Ref. client'].apply(extract_code_digits)
         f_abo['Code_Root_Fourn'] = f_abo['Ref. client'].apply(extract_code_root)
         f_abo['Art_Num'] = f_abo['Réf. produit'].apply(extract_art_num)
         f_abo['Client_Norm'] = f_abo['Client final'].apply(norm_txt)
@@ -790,22 +804,30 @@ if file_sim and file_ssc and files_csv:
                 for fi in matched_fis:
                     f_abo.at[fi, 'Pass_RAF'] = 'P4'
 
-            # Passe 5 : Code Client Exact Identique + Libellé Produit + Période
-            s_rem5 = [si for si in s_idx if sim_rec.at[si, 'Pass_RAF'] == '' and sim_rec.at[si, 'Code_Client_ERP_Norm'] != '']
+            # Passe 5 : Code Client Exact OU Radical Numérique (ex: OO100383 / AFIDF-OO100383 <-> 100383) + Libellé Produit + Période
+            s_rem5 = [si for si in s_idx if sim_rec.at[si, 'Pass_RAF'] == '' and (sim_rec.at[si, 'Code_Client_ERP_Norm'] != '' or sim_rec.at[si, 'Code_Digits_ERP'] != '')]
             f_rem_code_pm = {}
             for fi in f_idx:
-                if f_abo.at[fi, 'Pass_RAF'] == '' and f_abo.at[fi, 'Code_Client_Fourn_Norm'] != '':
-                    key = (f_abo.at[fi, 'Code_Client_Fourn_Norm'], f_abo.at[fi, 'Prod_Norm'], f_abo.at[fi, 'YM_Annexe'])
-                    f_rem_code_pm.setdefault(key, []).append(fi)
+                if f_abo.at[fi, 'Pass_RAF'] == '':
+                    c_norm_f = f_abo.at[fi, 'Code_Client_Fourn_Norm']
+                    c_dig_f = f_abo.at[fi, 'Code_Digits_Fourn']
+                    if c_norm_f:
+                        f_rem_code_pm.setdefault((c_norm_f, f_abo.at[fi, 'Prod_Norm'], f_abo.at[fi, 'YM_Annexe']), []).append(fi)
+                    if c_dig_f:
+                        f_rem_code_pm.setdefault((f"DIG_{c_dig_f}", f_abo.at[fi, 'Prod_Norm'], f_abo.at[fi, 'YM_Annexe']), []).append(fi)
+
             s_by_code_pm = {}
             for si in s_rem5:
-                key = (sim_rec.at[si, 'Code_Client_ERP_Norm'], sim_rec.at[si, 'Prod_Norm'], sim_rec.at[si, 'YM_ERP'])
+                c_key = sim_rec.at[si, 'Code_Client_ERP_Norm'] or f"DIG_{sim_rec.at[si, 'Code_Digits_ERP']}"
+                key = (c_key, sim_rec.at[si, 'Prod_Norm'], sim_rec.at[si, 'YM_ERP'], sim_rec.at[si, 'Code_Digits_ERP'])
                 s_by_code_pm.setdefault(key, []).append(si)
 
-            for key, sis in s_by_code_pm.items():
-                if key not in f_rem_code_pm:
-                    continue
-                matched_fis = [fi for fi in f_rem_code_pm[key] if f_abo.at[fi, 'Pass_RAF'] == '']
+            for (c_key, prod_n, ym_e, dig_e), sis in s_by_code_pm.items():
+                matched_fis = []
+                if (c_key, prod_n, ym_e) in f_rem_code_pm:
+                    matched_fis = [fi for fi in f_rem_code_pm[(c_key, prod_n, ym_e)] if f_abo.at[fi, 'Pass_RAF'] == '']
+                if not matched_fis and dig_e and (f"DIG_{dig_e}", prod_n, ym_e) in f_rem_code_pm:
+                    matched_fis = [fi for fi in f_rem_code_pm[(f"DIG_{dig_e}", prod_n, ym_e)] if f_abo.at[fi, 'Pass_RAF'] == '']
                 if not matched_fis:
                     continue
                 sum_s = sum(float(sim_rec.at[si, 'Montant HT']) for si in sis)
@@ -835,7 +857,7 @@ if file_sim and file_ssc and files_csv:
                 for fi in matched_fis:
                     f_abo.at[fi, 'Pass_RAF'] = 'P5'
 
-            # Passe 6 : Même Client (ou Code Client) + Même Montant HT Exact sur le même Dépôt
+            # Passe 6 : Même Client / Code Client / Radical Numérique + Même Montant HT Exact sur le même Dépôt
             f_by_client_ht = {}
             for fi in f_idx:
                 if f_abo.at[fi, 'Pass_RAF'] == '' and float(f_abo.at[fi, 'Total H.T.']) > 0:
@@ -844,6 +866,9 @@ if file_sim and file_ssc and files_csv:
                     cc_f = f_abo.at[fi, 'Code_Client_Fourn_Norm']
                     if cc_f:
                         f_by_client_ht.setdefault((f"CODE_{cc_f}", ht_r), []).append(fi)
+                    dig_f = f_abo.at[fi, 'Code_Digits_Fourn']
+                    if dig_f:
+                        f_by_client_ht.setdefault((f"DIG_{dig_f}", ht_r), []).append(fi)
 
             for si in s_idx:
                 if sim_rec.at[si, 'Pass_RAF'] != '':
@@ -853,9 +878,12 @@ if file_sim and file_ssc and files_csv:
                     continue
                 ce = sim_rec.at[si, 'Client_Norm']
                 cc_s = sim_rec.at[si, 'Code_Client_ERP_Norm']
+                dig_s = sim_rec.at[si, 'Code_Digits_ERP']
                 cand_keys = [(cf, ht_s) for cf in client_alias_map.get(ce, {ce})]
                 if cc_s:
                     cand_keys.append((f"CODE_{cc_s}", ht_s))
+                if dig_s:
+                    cand_keys.append((f"DIG_{dig_s}", ht_s))
                 matched_fi = None
                 for ck in cand_keys:
                     if ck in f_by_client_ht:
@@ -885,7 +913,7 @@ if file_sim and file_ssc and files_csv:
                     if avail:
                         bind_single_match(si, avail[0], 'P7_Root', 'Conforme')
 
-            # Passe 8 : Appariement de Substitution (Changement d'offre sur un même client et même dépôt)
+            # Passe 8 : Appariement de Substitution (Changement d'offre sur un même client/code/radical et même dépôt)
             f_by_client_rem = {}
             for fi in f_idx:
                 if f_abo.at[fi, 'Pass_RAF'] == '' and float(f_abo.at[fi, 'Total H.T.']) > 0:
@@ -893,21 +921,26 @@ if file_sim and file_ssc and files_csv:
                     cc_f = f_abo.at[fi, 'Code_Client_Fourn_Norm']
                     if cc_f:
                         f_by_client_rem.setdefault(f"CODE_{cc_f}", []).append(fi)
+                    dig_f = f_abo.at[fi, 'Code_Digits_Fourn']
+                    if dig_f:
+                        f_by_client_rem.setdefault(f"DIG_{dig_f}", []).append(fi)
 
             for si in s_idx:
                 if sim_rec.at[si, 'Pass_RAF'] != '' or float(sim_rec.at[si, 'Montant HT']) <= 0:
                     continue
                 ce = sim_rec.at[si, 'Client_Norm']
                 cc_s = sim_rec.at[si, 'Code_Client_ERP_Norm']
+                dig_s = sim_rec.at[si, 'Code_Digits_ERP']
                 cand_keys = list(client_alias_map.get(ce, {ce}))
                 if cc_s:
                     cand_keys.append(f"CODE_{cc_s}")
+                if dig_s:
+                    cand_keys.append(f"DIG_{dig_s}")
                 matched_fi = None
                 for ck in cand_keys:
                     if ck in f_by_client_rem:
                         avail = [fi for fi in f_by_client_rem[ck] if f_abo.at[fi, 'Pass_RAF'] == '']
                         if avail:
-                            # Prendre la ligne fournisseur au montant le plus proche
                             s_ht_val = float(sim_rec.at[si, 'Montant HT'])
                             avail.sort(key=lambda idx_f: abs(float(f_abo.at[idx_f, 'Total H.T.']) - s_ht_val))
                             matched_fi = avail[0]
