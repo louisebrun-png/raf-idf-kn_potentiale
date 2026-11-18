@@ -99,7 +99,6 @@ def norm_client_code(val):
     return s
 
 def extract_code_digits(val):
-    """Extrait la séquence numérique significative (>= 4 chiffres) d'un code client ou SSC (ex: OO100383 ou AFIDF-OO100383 -> 100383)."""
     s = norm_client_code(val)
     if not s:
         return ''
@@ -107,7 +106,6 @@ def extract_code_digits(val):
     return nums[-1] if nums else ''
 
 def extract_code_root(val):
-    """Extrait le radical client (6 premiers caractères alphanumériques) pour les comptes multi-sites."""
     s = re.sub(r'[^A-Z0-9]', '', norm_client_code(val))
     return s[:6] if len(s) >= 6 else ''
 
@@ -225,6 +223,8 @@ def compute_article_correction(row):
 
     if diag == 'Conforme 0€':
         return "Aucune action (0,00 €)"
+    if 'Résiliation vente non traitée' in diag:
+        return "Fermer contrat/ligne achat (Vente déjà fermée/suspendue)"
     if diag == "Migration / Substitution d'offre à valider":
         mda = to_mda_article(ref_annexe)
         return f"Valider migration offre -> Mettre à jour avec {mda}" if mda else "Valider migration d'offre"
@@ -309,7 +309,7 @@ def build_single_tab_excel(df_export):
                     c.fill = fill_ok
                 elif 'Interne / Non attribué' in diag_val:
                     c.fill = fill_neutral
-                elif 'Manquant' in diag_val or 'Erreur date' in diag_val or 'Doublon' in diag_val:
+                elif any(k in diag_val for k in ['Manquant', 'Erreur date', 'Doublon', 'Résiliation vente']):
                     c.fill = fill_err
                 elif 'Régul.' in diag_val:
                     c.fill = fill_regul
@@ -338,7 +338,7 @@ def build_single_tab_excel(df_export):
 
     for ci, col_name in enumerate(df_export.columns, start=1):
         max_len = max([len(str(col_name))] + [len(str(x)) for x in df_export.iloc[:, ci - 1].head(150)])
-        ws.column_dimensions[get_column_letter(ci)].width = min(max(max_len + 4, 14), 54)
+        ws.column_dimensions[get_column_letter(ci)].width = min(max(max_len + 4, 14), 56)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -350,7 +350,7 @@ def build_single_tab_excel(df_export):
 with st.sidebar:
     st.markdown("### 📁 Importation des Fichiers")
     file_sim = st.file_uploader("1. Simulation Achat Artis (.xlsx)", type=['xlsx'])
-    file_ssc = st.file_uploader("2. Listing des SSC Artis (.xlsx) — Requis TVA & Dépôts", type=['xlsx'])
+    file_ssc = st.file_uploader("2. Listing des SSC Artis (.xlsx) — Complet (Actifs + Fermés/Résiliés/Suspendus)", type=['xlsx'])
     files_pdf = st.file_uploader("3. Factures PDF Fournisseur (Optionnel)", type=['pdf'], accept_multiple_files=True)
     files_csv = st.file_uploader("4. Annexes Fournisseur (.csv)", type=['csv'], accept_multiple_files=True)
 
@@ -360,7 +360,7 @@ with st.sidebar:
 st.markdown("# 💼 Potentiale — Outil Métier RAF (Rapprochement Abonnements Fournisseurs)")
 st.markdown(
     "**Urbanisation SI & Pilotage Budgétaire** | Audit Fiscal TVA [STD Standard 20%], "
-    "Contrôle Seuil Groupe 3 % par Facture, Correspondance Partielle Codes Clients & Tri Anomalies en Tête"
+    "Détection Résiliations Vente Non Répercutées sur Achat, Seuil Groupe 3 % & Tri Anomalies en Tête"
 )
 
 with st.expander("📌 Correspondance Dépôts ERP = Factures Fournisseur (Règle d'Urbanisation Potentiale)", expanded=True):
@@ -378,12 +378,30 @@ st.markdown("---")
 SEUIL_PCT_GROUPE = 3.0
 
 if file_sim and file_ssc and files_csv:
-    with st.spinner("Exécution de l'audit fiscal, temporel et financier en cours..."):
+    with st.spinner("Exécution de l'audit fiscal, contractuel (vente/achat) et financier en cours..."):
         df_sim = read_xlsx_robust(file_sim)
         df_ssc = read_xlsx_robust(file_ssc)
 
+        # --- 0. ANALYSE DES STATUTS CONTRATS VENTE DANS LE LISTING SSC COMPLET ---
+        # Identification des clients dont TOUS les contrats de vente sont fermés, résiliés ou suspendus !
+        statuts_arret_vente = {'Fermée', 'Résiliée.Dans les délais', 'Résiliée.En attente', 'Suspendue', 'Résiliée', 'Annulée'}
+        df_ssc_clean = df_ssc.copy()
+        df_ssc_clean['Statut_Str'] = df_ssc_clean['Statut RFC'].fillna('').astype(str).str.strip()
+        df_ssc_clean['Code_Cli_Str'] = df_ssc_clean['Code client'].fillna('').astype(str).str.strip() if 'Code client' in df_ssc_clean.columns else ''
+        df_ssc_clean['Code_SSC_Str'] = df_ssc_clean['Code SSC'].fillna('').astype(str).str.strip()
+        df_ssc_clean['Is_Achat_Only'] = df_ssc_clean['Code_SSC_Str'].str.upper().str.startswith('AFIDF')
+
+        # Périmètre des contrats de vente (non AFIDF)
+        ssc_vente = df_ssc_clean[~df_ssc_clean['Is_Achat_Only']].copy()
+        clients_vente_active = set(
+            ssc_vente[~ssc_vente['Statut_Str'].isin(statuts_arret_vente)]['Code_Cli_Str'].unique()
+        ) - {''}
+        clients_vente_fermee_only = (
+            set(ssc_vente[ssc_vente['Statut_Str'].isin(statuts_arret_vente)]['Code_Cli_Str'].unique()) - clients_vente_active - {''}
+        )
+
         # --- 1. AUDIT FISCAL TVA SUR LE PARC SSC ACTIF ---
-        ssc_active = df_ssc[~df_ssc['Statut RFC'].isin(['Fermée', 'Résiliée.Dans les délais', 'Résiliée.En attente'])].copy()
+        ssc_active = df_ssc[~df_ssc['Statut RFC'].isin(statuts_arret_vente)].copy()
         tva_col = 'Coût ABONNEMENT Gestion TVA' if 'Coût ABONNEMENT Gestion TVA' in ssc_active.columns else None
         taux_col = 'Coût ABONNEMENT Taux TVA' if 'Coût ABONNEMENT Taux TVA' in ssc_active.columns else None
 
@@ -409,7 +427,7 @@ if file_sim and file_ssc and files_csv:
         charge_map = ssc_dedup.set_index(['Code SSC', 'Libellé RFC'])['Nom chargé factu SSC'].to_dict() if 'Nom chargé factu SSC' in ssc_dedup.columns else {}
 
         ssc_to_client_map = {}
-        for _, r_ssc in ssc_active.drop_duplicates(subset=['Code SSC']).iterrows():
+        for _, r_ssc in df_ssc_clean.drop_duplicates(subset=['Code SSC']).iterrows():
             c_ssc = str(r_ssc.get('Code SSC', '')).strip()
             if c_ssc:
                 ssc_to_client_map[c_ssc] = {
@@ -537,11 +555,10 @@ if file_sim and file_ssc and files_csv:
         sim_err_date = sim_all_rec[sim_all_rec['Statut_Temporel'] == 'Erreur Date Dernier Achat (< M-1)'].copy()
         sim_rec = sim_all_rec[sim_all_rec['Statut_Temporel'] != 'Erreur Date Dernier Achat (< M-1)'].copy()
 
-        # --- 5. MOTEUR DE RÉCONCILIATION EN 8 PASSES (AVEC RADICAL NUMÉRIQUE CODE CLIENT / SSC) ---
+        # --- 5. MOTEUR DE RÉCONCILIATION EN 8 PASSES ---
         sim_rec['Tech_ID'] = sim_rec.apply(get_erp_tech_id, axis=1)
         sim_rec['Sub_Client_Code'] = sim_rec['Tech_ID'].apply(norm_client_code)
         sim_rec['Code_Client_ERP_Norm'] = sim_rec['Code client'].apply(norm_client_code)
-        # Extraction de la partie numérique (>= 4 chiffres) du Code Client ou du Numéro SSC (ex: OO100383 / AFIDF-OO100383 -> 100383)
         sim_rec['Code_Digits_ERP'] = sim_rec.apply(
             lambda r: extract_code_digits(r['Code client']) or extract_code_digits(r['Code SSC']),
             axis=1
@@ -804,7 +821,7 @@ if file_sim and file_ssc and files_csv:
                 for fi in matched_fis:
                     f_abo.at[fi, 'Pass_RAF'] = 'P4'
 
-            # Passe 5 : Code Client Exact OU Radical Numérique (ex: OO100383 / AFIDF-OO100383 <-> 100383) + Libellé Produit + Période
+            # Passe 5 : Code Client Exact OU Radical Numérique (ex: OO1003383 / AFIDF-OO1003383 <-> 1003383) + Libellé Produit + Période
             s_rem5 = [si for si in s_idx if sim_rec.at[si, 'Pass_RAF'] == '' and (sim_rec.at[si, 'Code_Client_ERP_Norm'] != '' or sim_rec.at[si, 'Code_Digits_ERP'] != '')]
             f_rem_code_pm = {}
             for fi in f_idx:
@@ -948,7 +965,7 @@ if file_sim and file_ssc and files_csv:
                 if matched_fi is not None:
                     bind_single_match(si, matched_fi, 'P8_Sub', "Migration / Substitution d'offre à valider")
 
-        # --- 6. RÈGLE DE PRIORITÉ DOUBLONS, REGROUPEMENT PAR SSC (CATÉGORIE UNIQUE) & CODE 10 ---
+        # --- 6. RÈGLE DE PRIORITÉ DOUBLONS, REGROUPEMENT PAR SSC, RÉSILIATIONS VENTE & CODE 10 ---
         conforme_rows = sim_rec[sim_rec['Diagnostic'] == 'Conforme']
         conforme_signatures = set(zip(
             conforme_rows['Depot_Cible'],
@@ -975,6 +992,9 @@ if file_sim and file_ssc and files_csv:
                     sim_rec.at[si, 'Diagnostic'] = 'Doublon — Supprimer AFIDF (Contrat chiffré actif)'
                 else:
                     sim_rec.at[si, 'Diagnostic'] = 'Doublon — Conserver contrat chiffré (Fermer AFIDF)'
+            elif code_cli_str in clients_vente_fermee_only:
+                # Le client n'a plus aucun contrat de vente actif (tous fermés/résiliés/suspendus dans SSC) -> Résiliation non répercutée sur l'achat !
+                sim_rec.at[si, 'Diagnostic'] = 'Résiliation vente non traitée (Contrat vente fermé/suspendu)'
             elif num_ssc_str in f_unmatched_ssc_refs:
                 sim_rec.at[si, 'Diagnostic'] = 'Dossier lié via Numéro SSC'
             elif code_cli_str == '10':
@@ -1338,4 +1358,4 @@ if file_sim and file_ssc and files_csv:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 else:
-    st.info("👈 Importez la **Simulation Achat Artis**, le **Listing des SSC Artis** et vos **4 Annexes Fournisseur** dans le volet de gauche pour lancer l'analyse.")
+    st.info("👈 Importez la **Simulation Achat Artis**, le **Listing des SSC Artis** (complet avec fermés/résiliés/suspendus) et vos **4 Annexes Fournisseur** dans le volet de gauche pour lancer l'analyse.")
