@@ -328,7 +328,7 @@ with st.sidebar:
 st.markdown("# 💼 Potentiale — Outil Métier RAF (Rapprochement Abonnements Fournisseurs)")
 st.markdown(
     "**Fournisseur : Koesio Networks** | Urbanisation SI : Audit Fiscal TVA [STD Standard 20%], "
-    "Réconciliation Haute Précision (ID, Code Client + Article, Alias & Doublons) & Conforme 0€"
+    "Réconciliation Haute Précision (6 Passes), Priorité Contrats Chiffrés & Conforme 0€"
 )
 
 with st.expander("📌 Correspondance Dépôts ERP = Factures Fournisseur (Règle d'Urbanisation Potentiale)", expanded=True):
@@ -468,7 +468,6 @@ if file_sim and file_ssc and files_csv:
             f_list.append(df_c)
 
         f_all = pd.concat(f_list, ignore_index=True)
-        # Exclure également les lignes internes 026159 côté annexe si présentes
         f_all = f_all[~f_all['Ref. client'].astype(str).str.contains('026159', na=False)].copy()
 
         f_all['Total H.T.'] = pd.to_numeric(f_all['Total H.T.'], errors='coerce').fillna(0.0)
@@ -497,7 +496,7 @@ if file_sim and file_ssc and files_csv:
         sim_err_date = sim_all_rec[sim_all_rec['Statut_Temporel'] == 'Erreur Date Dernier Achat (< M-1)'].copy()
         sim_rec = sim_all_rec[sim_all_rec['Statut_Temporel'] != 'Erreur Date Dernier Achat (< M-1)'].copy()
 
-        # --- 5. MOTEUR DE RÉCONCILIATION MULTI-PASSES ENRICHI ---
+        # --- 5. MOTEUR DE RÉCONCILIATION EN 6 PASSES ---
         sim_rec['Tech_ID'] = sim_rec.apply(get_erp_tech_id, axis=1)
         sim_rec['Sub_Client_Code'] = sim_rec['Tech_ID'].apply(norm_client_code)
         sim_rec['Code_Client_ERP_Norm'] = sim_rec['Code client'].apply(norm_client_code)
@@ -555,7 +554,7 @@ if file_sim and file_ssc and files_csv:
             s_idx = s_sub.index
             f_idx = f_abo[f_abo['Depot_Fourn'] == dep].index
 
-            # Passe 1 : Identifiant technique + montant identique (Priorité aux contrats chiffrés)
+            # Passe 1 : Identifiant technique + montant identique
             f_by_id = {}
             for fi in f_idx:
                 tid = f_abo.at[fi, 'Tech_ID']
@@ -587,7 +586,7 @@ if file_sim and file_ssc and files_csv:
                         bind_single_match(si, fi, 'P1b', classify_mismatch_diag(qt_a, deb_e, deb_a))
                         break
 
-            # Passe 2 : Entités Régionales logées dans l'Identifiant Technique (FNTP) avec filtrage article/montant cohérent
+            # Passe 2 : Entités Régionales logées dans l'Identifiant Technique (FNTP)
             f_by_ccode = {}
             for fi in f_idx:
                 if f_abo.at[fi, 'Pass_RAF'] == '':
@@ -619,7 +618,7 @@ if file_sim and file_ssc and files_csv:
                     qt_a = float(f_abo.at[fi, 'Qté'])
                     bind_single_match(si, fi, 'P2_Reg', classify_mismatch_diag(qt_a, sim_rec.at[si, 'Deb_ERP_Fmt'], f_abo.at[fi, 'Deb_Annexe_Fmt']))
 
-            # Passe 3a : Code Client Strict Identique + Code Article Numérique (KNxxxx == xxxx) + Période (ex: NS_001967, CO_7526)
+            # Passe 3a : Code Client Strict Identique + Code Article Numérique (KNxxxx == xxxx) + Période
             s_rem3a = [si for si in s_idx if sim_rec.at[si, 'Pass_RAF'] == '' and sim_rec.at[si, 'Code_Client_ERP_Norm'] != '' and sim_rec.at[si, 'Art_Num'] not in ('', '2912')]
             f_rem_code_am = {}
             for fi in f_idx:
@@ -664,7 +663,7 @@ if file_sim and file_ssc and files_csv:
                 for fi in matched_fis:
                     f_abo.at[fi, 'Pass_RAF'] = 'P3a'
 
-            # Passe 3b : Alias Client + Code Article Numérique (KNxxxx == xxxx) + Période (Mois)
+            # Passe 3b : Alias Client + Code Article Numérique (KNxxxx == xxxx) + Période
             s_rem = [si for si in s_idx if sim_rec.at[si, 'Pass_RAF'] == '' and sim_rec.at[si, 'Art_Num'] not in ('', '2912')]
             f_rem_cam = {}
             for fi in f_idx:
@@ -801,6 +800,37 @@ if file_sim and file_ssc and files_csv:
                 for fi in matched_fis:
                     f_abo.at[fi, 'Pass_RAF'] = 'P5'
 
+            # Passe 6 : Même Client (ou Code Client) + Même Montant HT Exact sur le même Dépôt (absorbe les changements de référence produit à tarif identique)
+            f_by_client_ht = {}
+            for fi in f_idx:
+                if f_abo.at[fi, 'Pass_RAF'] == '' and float(f_abo.at[fi, 'Total H.T.']) > 0:
+                    ht_r = round(float(f_abo.at[fi, 'Total H.T.']), 2)
+                    f_by_client_ht.setdefault((f_abo.at[fi, 'Client_Norm'], ht_r), []).append(fi)
+                    cc_f = f_abo.at[fi, 'Code_Client_Fourn_Norm']
+                    if cc_f:
+                        f_by_client_ht.setdefault((f"CODE_{cc_f}", ht_r), []).append(fi)
+
+            for si in s_idx:
+                if sim_rec.at[si, 'Pass_RAF'] != '':
+                    continue
+                ht_s = round(float(sim_rec.at[si, 'Montant HT']), 2)
+                if ht_s <= 0:
+                    continue
+                ce = sim_rec.at[si, 'Client_Norm']
+                cc_s = sim_rec.at[si, 'Code_Client_ERP_Norm']
+                cand_keys = [(cf, ht_s) for cf in client_alias_map.get(ce, {ce})]
+                if cc_s:
+                    cand_keys.append((f"CODE_{cc_s}", ht_s))
+                matched_fi = None
+                for ck in cand_keys:
+                    if ck in f_by_client_ht:
+                        avail = [fi for fi in f_by_client_ht[ck] if f_abo.at[fi, 'Pass_RAF'] == '']
+                        if avail:
+                            matched_fi = avail[0]
+                            break
+                if matched_fi is not None:
+                    bind_single_match(si, matched_fi, 'P6_Tarif', 'Conforme')
+
         # --- 6. RÈGLE DE PRIORITÉ DOUBLONS (UNITAIRES + GROUPÉS) & QUALIFICATION CODE CLIENT 10 ---
         conforme_rows = sim_rec[sim_rec['Diagnostic'] == 'Conforme']
         conforme_signatures = set(zip(
@@ -808,7 +838,6 @@ if file_sim and file_ssc and files_csv:
             conforme_rows['Client_Norm'],
             conforme_rows['Montant HT'].round(2)
         ))
-        # Somme déjà rapprochée en 'Conforme' par (Dépôt, Client, Article) pour détecter les doublons groupés (ex: Qté 31 = 208.32 €)
         conforme_grouped_sums = conforme_rows.groupby(['Depot_Cible', 'Client_Norm', 'Art_Num'])['Montant HT'].sum().round(2).to_dict()
 
         for si in sim_rec[sim_rec['Pass_RAF'] == ''].index:
