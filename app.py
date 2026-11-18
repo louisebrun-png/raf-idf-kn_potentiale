@@ -98,6 +98,11 @@ def norm_client_code(val):
     s = re.sub(r'^TO_', '', s)
     return s
 
+def extract_code_root(val):
+    """Extrait le radical client (6 premiers caractères alphanumériques) pour les comptes multi-sites."""
+    s = re.sub(r'[^A-Z0-9]', '', norm_client_code(val))
+    return s[:6] if len(s) >= 6 else ''
+
 def extract_art_num(val):
     s = str(val or '').strip().upper()
     if s in ('', 'NAN', 'NONE'):
@@ -212,6 +217,9 @@ def compute_article_correction(row):
 
     if diag == 'Conforme 0€':
         return "Aucune action (0,00 €)"
+    if diag == "Migration / Substitution d'offre à valider":
+        mda = to_mda_article(ref_annexe)
+        return f"Valider migration offre -> Mettre à jour avec {mda}" if mda else "Valider migration d'offre"
     if diag == 'Dossier lié via Numéro SSC':
         mda = to_mda_article(ref_annexe)
         if mda and not art_erp:
@@ -297,7 +305,7 @@ def build_single_tab_excel(df_export):
                     c.fill = fill_err
                 elif 'Régul.' in diag_val:
                     c.fill = fill_regul
-                elif 'prorata' in diag_val or diag_val == 'Dossier lié via Numéro SSC':
+                elif 'prorata' in diag_val or diag_val == 'Dossier lié via Numéro SSC' or 'Substitution' in diag_val:
                     c.fill = fill_prorata
                 else:
                     c.fill = fill_warn
@@ -343,8 +351,8 @@ with st.sidebar:
 # ==============================================================================
 st.markdown("# 💼 Potentiale — Outil Métier RAF (Rapprochement Abonnements Fournisseurs)")
 st.markdown(
-    "**Fournisseur : Koesio Networks** | Urbanisation SI : Audit Fiscal TVA [STD Standard 20%], "
-    "Exclusion Stricte Dépôt 026159, Priorité Contrats Chiffrés & Tri Anomalies en Tête"
+    "**Urbanisation SI & Pilotage Budgétaire** | Audit Fiscal TVA [STD Standard 20%], "
+    "Contrôle Seuil Groupe 3 % par Facture, Réconciliation 8 Passes & Tri Anomalies en Tête"
 )
 
 with st.expander("📌 Correspondance Dépôts ERP = Factures Fournisseur (Règle d'Urbanisation Potentiale)", expanded=True):
@@ -359,7 +367,7 @@ st.markdown("---")
 # ==============================================================================
 # TRAITEMENT MÉTIER AUTOMATISÉ
 # ==============================================================================
-SEUIL_ALERTE_HT = 500.0
+SEUIL_PCT_GROUPE = 3.0
 
 if file_sim and file_ssc and files_csv:
     with st.spinner("Exécution de l'audit fiscal, temporel et financier en cours..."):
@@ -521,10 +529,11 @@ if file_sim and file_ssc and files_csv:
         sim_err_date = sim_all_rec[sim_all_rec['Statut_Temporel'] == 'Erreur Date Dernier Achat (< M-1)'].copy()
         sim_rec = sim_all_rec[sim_all_rec['Statut_Temporel'] != 'Erreur Date Dernier Achat (< M-1)'].copy()
 
-        # --- 5. MOTEUR DE RÉCONCILIATION EN 6 PASSES ---
+        # --- 5. MOTEUR DE RÉCONCILIATION EN 8 PASSES ---
         sim_rec['Tech_ID'] = sim_rec.apply(get_erp_tech_id, axis=1)
         sim_rec['Sub_Client_Code'] = sim_rec['Tech_ID'].apply(norm_client_code)
         sim_rec['Code_Client_ERP_Norm'] = sim_rec['Code client'].apply(norm_client_code)
+        sim_rec['Code_Root_ERP'] = sim_rec['Code client'].apply(extract_code_root)
         sim_rec['Art_Num'] = sim_rec['Code Article'].apply(extract_art_num)
         sim_rec['Prod_Lib'] = sim_rec['Libellé RFC'].apply(lambda s: str(s).split('//')[0].strip())
         sim_rec['Client_Norm'] = sim_rec['Client'].apply(norm_txt)
@@ -533,6 +542,7 @@ if file_sim and file_ssc and files_csv:
 
         f_abo['Tech_ID'] = f_abo['Matricule fournisseur'].fillna('').astype(str).str.replace('.0', '', regex=False).str.strip()
         f_abo['Code_Client_Fourn_Norm'] = f_abo['Ref. client'].apply(norm_client_code)
+        f_abo['Code_Root_Fourn'] = f_abo['Ref. client'].apply(extract_code_root)
         f_abo['Art_Num'] = f_abo['Réf. produit'].apply(extract_art_num)
         f_abo['Client_Norm'] = f_abo['Client final'].apply(norm_txt)
         f_abo['Prod_Norm'] = f_abo['Libellé produit'].apply(norm_txt)
@@ -856,6 +866,55 @@ if file_sim and file_ssc and files_csv:
                 if matched_fi is not None:
                     bind_single_match(si, matched_fi, 'P6_Tarif', 'Conforme')
 
+            # Passe 7 : Code Client Racine (Préfixe multi-sites) + Montant HT Exact sur le même Dépôt
+            f_by_root_ht = {}
+            for fi in f_idx:
+                if f_abo.at[fi, 'Pass_RAF'] == '' and float(f_abo.at[fi, 'Total H.T.']) > 0:
+                    rt_f = f_abo.at[fi, 'Code_Root_Fourn']
+                    if rt_f:
+                        ht_r = round(float(f_abo.at[fi, 'Total H.T.']), 2)
+                        f_by_root_ht.setdefault((rt_f, ht_r), []).append(fi)
+
+            for si in s_idx:
+                if sim_rec.at[si, 'Pass_RAF'] != '':
+                    continue
+                rt_s = sim_rec.at[si, 'Code_Root_ERP']
+                ht_s = round(float(sim_rec.at[si, 'Montant HT']), 2)
+                if rt_s and ht_s > 0 and (rt_s, ht_s) in f_by_root_ht:
+                    avail = [fi for fi in f_by_root_ht[(rt_s, ht_s)] if f_abo.at[fi, 'Pass_RAF'] == '']
+                    if avail:
+                        bind_single_match(si, avail[0], 'P7_Root', 'Conforme')
+
+            # Passe 8 : Appariement de Substitution (Changement d'offre sur un même client et même dépôt)
+            f_by_client_rem = {}
+            for fi in f_idx:
+                if f_abo.at[fi, 'Pass_RAF'] == '' and float(f_abo.at[fi, 'Total H.T.']) > 0:
+                    f_by_client_rem.setdefault(f_abo.at[fi, 'Client_Norm'], []).append(fi)
+                    cc_f = f_abo.at[fi, 'Code_Client_Fourn_Norm']
+                    if cc_f:
+                        f_by_client_rem.setdefault(f"CODE_{cc_f}", []).append(fi)
+
+            for si in s_idx:
+                if sim_rec.at[si, 'Pass_RAF'] != '' or float(sim_rec.at[si, 'Montant HT']) <= 0:
+                    continue
+                ce = sim_rec.at[si, 'Client_Norm']
+                cc_s = sim_rec.at[si, 'Code_Client_ERP_Norm']
+                cand_keys = list(client_alias_map.get(ce, {ce}))
+                if cc_s:
+                    cand_keys.append(f"CODE_{cc_s}")
+                matched_fi = None
+                for ck in cand_keys:
+                    if ck in f_by_client_rem:
+                        avail = [fi for fi in f_by_client_rem[ck] if f_abo.at[fi, 'Pass_RAF'] == '']
+                        if avail:
+                            # Prendre la ligne fournisseur au montant le plus proche
+                            s_ht_val = float(sim_rec.at[si, 'Montant HT'])
+                            avail.sort(key=lambda idx_f: abs(float(f_abo.at[idx_f, 'Total H.T.']) - s_ht_val))
+                            matched_fi = avail[0]
+                            break
+                if matched_fi is not None:
+                    bind_single_match(si, matched_fi, 'P8_Sub', "Migration / Substitution d'offre à valider")
+
         # --- 6. RÈGLE DE PRIORITÉ DOUBLONS, REGROUPEMENT PAR SSC (CATÉGORIE UNIQUE) & CODE 10 ---
         conforme_rows = sim_rec[sim_rec['Diagnostic'] == 'Conforme']
         conforme_signatures = set(zip(
@@ -884,7 +943,6 @@ if file_sim and file_ssc and files_csv:
                 else:
                     sim_rec.at[si, 'Diagnostic'] = 'Doublon — Conserver contrat chiffré (Fermer AFIDF)'
             elif num_ssc_str in f_unmatched_ssc_refs:
-                # Catégorie strictement unique pour l'écran de synthèse et le fichier
                 sim_rec.at[si, 'Diagnostic'] = 'Dossier lié via Numéro SSC'
             elif code_cli_str == '10':
                 sim_rec.at[si, 'Diagnostic'] = 'Interne / Non attribué (Code 10)'
@@ -1089,7 +1147,7 @@ if file_sim and file_ssc and files_csv:
                     st.dataframe(anomalies_tva[['Code SSC', 'Raison sociale client', 'Code RFC', 'Libellé RFC', 'Gestion_TVA', 'Taux_TVA', 'Assiette_HT']], use_container_width=True, hide_index=True)
 
         # ----------------------------------------------------------------------
-        # ONGLET 2 : ABONNEMENTS RÉCURRENTS HT
+        # ONGLET 2 : ABONNEMENTS RÉCURRENTS HT (AVEC CONTRÔLE SEUIL GROUPE 3 %)
         # ----------------------------------------------------------------------
         with tab2:
             st.markdown(f"## ⏳ Audit de Temporalité ERP (Clôture {mois_detecte} — Prorata {mois_m1_label} Admis)")
@@ -1100,12 +1158,13 @@ if file_sim and file_ssc and files_csv:
             t4.metric("⏳ Anomalies Modules / Dates", f"{nb_retards} lignes")
 
             st.markdown("---")
-            st.markdown(f"## 🧮 Synthèse Macro-Financière HT (Périmètre {mois_detecte} & {mois_m1_label} Hors Dépôt 026159)")
+            st.markdown(f"## 🧮 Synthèse Macro-Financière HT & Seuil Groupe 3 % (Périmètre {mois_detecte} & {mois_m1_label})")
 
             tot_sim_perimetre_ht = sim_rec['Montant HT'].sum()
             tot_err_date_ht = sim_err_date['Montant HT'].sum()
             tot_fourn_facture_ht = f_abo['Total H.T.'].sum()
             ecart_net_global = tot_sim_perimetre_ht - tot_fourn_facture_ht
+            pct_ecart_global = (abs(ecart_net_global) / tot_fourn_facture_ht * 100.0) if tot_fourn_facture_ht > 0 else 0.0
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric(f"Simulation Artis ({mois_detecte} + {mois_m1_label})", f"{tot_sim_perimetre_ht:,.2f} €")
@@ -1113,8 +1172,8 @@ if file_sim and file_ssc and files_csv:
             m3.metric(
                 "Écart Net Récurrent (+ / -)",
                 format_ecart_signe(ecart_net_global),
-                delta="🚨 Attention (> 500 €)" if abs(ecart_net_global) > SEUIL_ALERTE_HT else "✅ Dans le seuil",
-                delta_color="inverse" if abs(ecart_net_global) > SEUIL_ALERTE_HT else "normal"
+                delta=f"{pct_ecart_global:.2f} % vs Facture (Seuil Max 3 %)",
+                delta_color="inverse" if pct_ecart_global > SEUIL_PCT_GROUPE else "normal"
             )
             m4.metric(
                 f"Erreur Date ERP (< {mois_m1_label})",
@@ -1123,14 +1182,7 @@ if file_sim and file_ssc and files_csv:
                 delta_color="inverse"
             )
 
-            if abs(ecart_net_global) > SEUIL_ALERTE_HT:
-                st.warning(
-                    f"🚨 **Attention (Écart > 500 €) :** L'écart net sur le périmètre courant ({mois_detecte} & {mois_m1_label}) atteint **{format_ecart_signe(ecart_net_global)} HT** "
-                    "(un signe **`+`** indique un surplus de lignes actives dans l'ERP — résiliations d'achats à passer ; "
-                    "un signe **`-`** indique des prestations facturées absentes de l'ERP)."
-                )
-
-            st.markdown("### 📋 Comparatif Détaillé par Dépôt (= Facture Fournisseur Hors Consommations)")
+            st.markdown("### 📋 Comparatif Détaillé par Dépôt — Pilotage Seuil Groupe 3 % Max par Facture")
             rows_dep = []
             for dep, fact_nom in [
                 ('AF-KN-Ope', 'Facture Abonnements Opérateur'),
@@ -1144,15 +1196,21 @@ if file_sim and file_ssc and files_csv:
                 err_m = s_err['Montant HT'].sum()
                 fourn_m = f_d['Total H.T.'].sum()
                 ecart_m = sim_m - fourn_m
-                alerte_txt = "🚨 ATTENTION (> 500 €)" if abs(ecart_m) > SEUIL_ALERTE_HT else "✅ OK (< 500 €)"
+                pct_m = (abs(ecart_m) / fourn_m * 100.0) if fourn_m > 0 else 0.0
+                plafond_3pct = fourn_m * (SEUIL_PCT_GROUPE / 100.0)
+                a_resorber = max(0.0, abs(ecart_m) - plafond_3pct)
+                statut_3pct = f"🚨 HORS SEUIL ({pct_m:.2f}% > 3%)" if pct_m > SEUIL_PCT_GROUPE else f"✅ CONFORME ({pct_m:.2f}% <= 3%)"
+
                 rows_dep.append({
                     'Code Dépôt': dep,
                     'Facture Associée': fact_nom,
                     f'Simulation ({mois_detecte}+{mois_m1_label}) HT': round(sim_m, 2),
                     'Facture Fournisseur HT': round(fourn_m, 2),
                     'Écart Net (+ / -)': format_ecart_signe(ecart_m),
-                    f'Erreur Date ERP (< {mois_m1_label}) HT': round(err_m, 2),
-                    'Contrôle Seuil 500 €': alerte_txt
+                    '% Écart': f"{pct_m:.2f} %",
+                    'Plafond 3 % HT': round(plafond_3pct, 2),
+                    'Reste à Résorber HT': round(a_resorber, 2),
+                    'Contrôle Seuil Groupe 3 %': statut_3pct
                 })
             df_comp_dep = pd.DataFrame(rows_dep)
             st.dataframe(df_comp_dep, use_container_width=True, hide_index=True)
