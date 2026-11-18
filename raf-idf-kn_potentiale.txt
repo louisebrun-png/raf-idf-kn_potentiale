@@ -1,0 +1,4 @@
+raf-idf-kn_potentiale/
+├── app.py                  # Code principal de l'interface Streamlit
+├── requirements.txt        # Bibliothèques Python nécessaires
+└── README.md               # Fiche d'identité du projet pour l'équipe
