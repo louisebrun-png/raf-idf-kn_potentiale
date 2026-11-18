@@ -536,4 +536,218 @@ if file_sim and file_ssc and files_csv:
             'Diagnostic': sim_rec['Diagnostic']
         })
 
-        f_un
+        f_unm = f_abo[f_abo['Pass_RAF'] == ''].copy()
+        df_part_fourn = pd.DataFrame({
+            'Code Dépôt (Origine Facture)': f_unm['Depot_Fourn'],
+            'Facture Associée': f_unm['Facture_Label'],
+            'Chargé Factu': '',
+            'Code Client ERP': '',
+            'Code Client Annexe': f_unm['Ref. client'].fillna(''),
+            'Client ERP': '',
+            'Client Annexe': f_unm['Client final'].fillna(''),
+            'Numéro SSC': '',
+            'Numéro RFC': '',
+            'Code Article ERP': '',
+            'Réf. Produit Annexe': f_unm['Réf. produit'].fillna(''),
+            'Libellé RFC': '',
+            'Libellé Annexe': f_unm['Libellé produit'].fillna(''),
+            'Identifiant Technique': f_unm['Tech_ID'],
+            'Qté ERP': 0.0,
+            'Qté Annexe': f_unm['Qté'],
+            'P.U. ERP HT': 0.0,
+            'P.U. Annexe HT': f_unm['P.U. HT'],
+            'Montant ERP HT': 0.0,
+            'Montant Annexe HT': f_unm['Total H.T.'],
+            'Écart HT (+ / -)': -f_unm['Total H.T.'],
+            'Diagnostic': 'Manquant erp'
+        })
+
+        df_conso_unique = pd.concat([df_part_erp, df_part_fourn], ignore_index=True).sort_values(
+            by=['Code Dépôt (Origine Facture)', 'Diagnostic', 'Client ERP', 'Client Annexe'],
+            ascending=[True, True, True, True]
+        )
+
+        # ======================================================================
+        # NAVIGATION EN 4 ONGLETS MÉTIERS (STANDARD POTENTIALE)
+        # ======================================================================
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "🚨 1. Audit TVA (S 20% vs AE 0%)",
+            "📊 2. Abonnements Récurrents HT",
+            "📦 3. Frais Ponctuels par Dépôt (FAS)",
+            "📞 4. Consommations par Dépôt"
+        ])
+
+        # ----------------------------------------------------------------------
+        # ONGLET 1 : AUDIT TVA (S 20% VS AE 0%)
+        # ----------------------------------------------------------------------
+        with tab1:
+            st.markdown("## 🚨 Audit Fiscal TVA — Contrôle Régime Standard (20%) vs Autoliquidation (AE)")
+            st.info("**Règle d'Audit Potentiale :** L'ensemble des prestations facturées par le partenaire relève exclusivement du régime français **Standard à 20 %**. Toute ligne paramétrée en **AE (0 %)** dans l'ERP constitue une anomalie fiscale bloquante.")
+
+            if not ssc_tva.empty:
+                nb_ae = len(anomalies_tva)
+                assiette_totale = ssc_tva['Assiette_HT'].sum()
+                assiette_ae = anomalies_tva['Assiette_HT'].sum()
+
+                k1, k2, k3 = st.columns(3)
+                k1.metric("Règles Actives Contrôlées", f"{len(ssc_tva):,}".replace(',', ' '))
+                k2.metric("Assiette Mensuelle HT Auditée", f"{assiette_totale:,.2f} €")
+                k3.metric("Anomalies AE (0%) Détectées", f"{nb_ae} ligne(s)", delta=f"{assiette_ae:,.2f} € HT" if nb_ae > 0 else "0,00 € (Conforme)", delta_color="inverse")
+
+                if nb_ae == 0:
+                    st.success("✅ **Audit Fiscal 100 % Conforme :** Aucune règle active n'est paramétrée en autoliquidation (AE 0%). Toutes les lignes sont bien configurées en régime Standard 20 %.")
+                else:
+                    st.error(f"⚠️ **Attention :** {nb_ae} règle(s) présentent un paramétrage TVA non conforme à basculer en Standard 20 % :")
+                    st.dataframe(anomalies_tva[['Code SSC', 'Raison sociale client', 'Code RFC', 'Libellé RFC', 'Gestion_TVA', 'Taux_TVA', 'Assiette_HT']], use_container_width=True, hide_index=True)
+
+        # ----------------------------------------------------------------------
+        # ONGLET 2 : ABONNEMENTS RÉCURRENTS HT
+        # ----------------------------------------------------------------------
+        with tab2:
+            st.markdown(f"## ⏳ Audit de Temporalité ERP (Mois détecté : {mois_detecte})")
+            t1, t2, t3, t4 = st.columns(4)
+            t1.metric("🟢 Cycles Conformes", f"{nb_conformes} lignes")
+            t2.metric("🔵 Régularisations Échues", f"{nb_echues} lignes")
+            t3.metric("ℹ️ Facturations Anticipées", f"{nb_anticipees} lignes")
+            t4.metric("🚨 Retards / Anomalies Dates", f"{nb_retards} lignes")
+
+            st.markdown("---")
+            st.markdown("## 🧮 Synthèse Macro-Financière HT (Abonnements Récurrents Hors Consommations)")
+
+            tot_sim_ht = sim_rec['Montant HT'].sum()
+            tot_fourn_facture_ht = f_abo['Total H.T.'].sum()
+            ecart_net_global = tot_sim_ht - tot_fourn_facture_ht
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Simulation Artis (Achats)", f"{tot_sim_ht:,.2f} €")
+            m2.metric("Total Facturé Fournisseur (Hors Conso)", f"{tot_fourn_facture_ht:,.2f} €")
+            m3.metric(
+                "Écart Net Global HT (+ / -)",
+                format_ecart_signe(ecart_net_global),
+                delta="🚨 Attention (> 500 €)" if abs(ecart_net_global) > SEUIL_ALERTE_HT else "✅ Dans le seuil",
+                delta_color="inverse" if abs(ecart_net_global) > SEUIL_ALERTE_HT else "normal"
+            )
+
+            if abs(ecart_net_global) > SEUIL_ALERTE_HT:
+                st.warning(
+                    f"🚨 **Attention (Écart > 500 €) :** L'écart net global atteint **{format_ecart_signe(ecart_net_global)} HT** "
+                    "(un signe **`+`** indique un surplus de lignes actives dans l'ERP — résiliations d'achats à passer ; "
+                    "un signe **`-`** indique des prestations facturées absentes de l'ERP)."
+                )
+
+            st.markdown("### 📋 Comparatif Détaillé par Dépôt (= Facture Fournisseur Hors Consommations)")
+            rows_dep = []
+            for dep, fact_nom in [
+                ('AF-KN-Ope', 'Facture Abonnements Opérateur'),
+                ('AF-KN-MOB', 'Facture Forfaits Mobiles'),
+                ('AF-KN-Heberg', 'Facture Abonnements Hébergement')
+            ]:
+                s_d = sim_rec[sim_rec['Depot_Cible'] == dep]
+                f_d = f_abo[f_abo['Depot_Fourn'] == dep]
+                sim_m = s_d['Montant HT'].sum()
+                fourn_m = f_d['Total H.T.'].sum()
+                ecart_m = sim_m - fourn_m
+                alerte_txt = "🚨 ATTENTION (> 500 €)" if abs(ecart_m) > SEUIL_ALERTE_HT else "✅ OK (< 500 €)"
+                rows_dep.append({
+                    'Code Dépôt': dep,
+                    'Facture Associée': fact_nom,
+                    'Total Simulation ERP HT': round(sim_m, 2),
+                    'Total Facture Fournisseur HT': round(fourn_m, 2),
+                    'Écart Net (+ / -)': format_ecart_signe(ecart_m),
+                    'Contrôle Seuil 500 €': alerte_txt
+                })
+            df_comp_dep = pd.DataFrame(rows_dep)
+            st.dataframe(df_comp_dep, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            st.markdown("### 🔎 Table Consolidée de Contrôle & Diagnostic ADV (Tous Dépôts)")
+
+            col_f1, col_f2 = st.columns(2)
+            with col_f1:
+                filtre_diag = st.multiselect(
+                    "Filtrer par Diagnostic :",
+                    options=['Conforme', 'Manquant annexe fournisseur', 'Manquant erp', 'Écart Prix / Quantité'],
+                    default=['Manquant annexe fournisseur', 'Manquant erp', 'Écart Prix / Quantité']
+                )
+            with col_f2:
+                filtre_dep = st.multiselect(
+                    "Filtrer par Code Dépôt :",
+                    options=['AF-KN-Ope', 'AF-KN-MOB', 'AF-KN-Heberg'],
+                    default=['AF-KN-Ope', 'AF-KN-MOB', 'AF-KN-Heberg']
+                )
+
+            df_vue = df_conso_unique[
+                df_conso_unique['Diagnostic'].isin(filtre_diag) &
+                df_conso_unique['Code Dépôt (Origine Facture)'].isin(filtre_dep)
+            ]
+            st.dataframe(df_vue, use_container_width=True, hide_index=True)
+
+        # ----------------------------------------------------------------------
+        # ONGLET 3 : FRAIS PONCTUELS PAR DÉPÔT (FAS)
+        # ----------------------------------------------------------------------
+        with tab3:
+            st.markdown("## 📦 Ventilation Analytique des Frais Ponctuels par Dépôt (Facture FAS)")
+            st.info("**Règle de Répartition Potentiale :** Les frais de mise en service (`FAS`) sont isolés de la facturation récurrente et ventilés par dépôt cible pour contrôle sur bons de livraison.")
+
+            if not f_fas.empty:
+                fas_ope = f_fas[f_fas['Depot_Ventilation'] == 'AF-KN-Ope']['Total H.T.'].sum()
+                fas_mob = f_fas[f_fas['Depot_Ventilation'] == 'AF-KN-MOB']['Total H.T.'].sum()
+                fas_heb = f_fas[f_fas['Depot_Ventilation'] == 'AF-KN-Heberg']['Total H.T.'].sum()
+
+                fc1, fc2, fc3, fc4 = st.columns(4)
+                fc1.metric("Total Facture FAS HT", f"{f_fas['Total H.T.'].sum():,.2f} €")
+                fc2.metric("Ventilation AF-KN-Ope", f"{fas_ope:,.2f} € HT")
+                fc3.metric("Ventilation AF-KN-MOB", f"{fas_mob:,.2f} € HT")
+                fc4.metric("Ventilation AF-KN-Heberg", f"{fas_heb:,.2f} € HT")
+
+                st.dataframe(
+                    f_fas[['Depot_Ventilation', 'Ref. client', 'Client final', 'Site', 'Réf. produit', 'Libellé produit', 'Matricule fournisseur', 'Date début', 'Qté', 'P.U. HT', 'Total H.T.']].sort_values(by=['Depot_Ventilation', 'Total H.T.'], ascending=[True, False]),
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.warning("Aucune ligne de frais ponctuels (FAS) détectée dans les annexes chargées.")
+
+        # ----------------------------------------------------------------------
+        # ONGLET 4 : CONSOMMATIONS PAR DÉPÔT
+        # ----------------------------------------------------------------------
+        with tab4:
+            st.markdown("## 📞 Ventilation Analytique des Consommations par Dépôt (Variables Pied de Facture)")
+            st.info("**Règle de Répartition Potentiale :** Ces montants variables (`CONSO`) sont exclus des abonnements fixes et doivent être ajoutés directement en pied de facture d'achat dans Artis sur chaque dépôt.")
+
+            conso_ope = f_conso[f_conso['Depot_Fourn'] == 'AF-KN-Ope']['Total H.T.'].sum()
+            conso_mob = f_conso[f_conso['Depot_Fourn'] == 'AF-KN-MOB']['Total H.T.'].sum()
+            conso_heb = f_conso[f_conso['Depot_Fourn'] == 'AF-KN-Heberg']['Total H.T.'].sum()
+
+            cc1, cc2, cc3 = st.columns(3)
+            cc1.metric("AF-KN-Ope (Consommations Opérateur)", f"{conso_ope:,.2f} € HT", delta="À ajouter sur facture d'achat Ope")
+            cc2.metric("AF-KN-MOB (Consommations Mobiles)", f"{conso_mob:,.2f} € HT", delta="À ajouter sur facture d'achat MOB")
+            cc3.metric("AF-KN-Heberg (Consommations Cloud)", f"{conso_heb:,.2f} € HT", delta="À ajouter sur facture d'achat Heberg")
+
+            st.markdown("### 📋 Synthèse des Variables de Consommation à Saisir dans Artis")
+            df_conso_synth = f_conso.groupby(['Depot_Fourn', 'Facture_Label', 'Libellé produit'], as_index=False).agg(
+                Nombre_Lignes=('Total H.T.', 'count'),
+                Montant_HT_A_Ajouter=('Total H.T.', 'sum')
+            )
+            st.dataframe(df_conso_synth, use_container_width=True, hide_index=True)
+
+            st.markdown("### 🔎 Détail des Lignes de Consommation par Client")
+            st.dataframe(
+                f_conso[['Depot_Fourn', 'Ref. client', 'Client final', 'Site', 'Matricule fournisseur', 'Date début', 'Date fin', 'Total H.T.']].sort_values(by=['Depot_Fourn', 'Total H.T.'], ascending=[True, False]),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        # ======================================================================
+        # EXPORT EXCEL UNIQUE : Rapprochement_Abonnements_HT_IDF_KN.xlsx
+        # ======================================================================
+        st.markdown("---")
+        excel_bytes = build_single_tab_excel(df_conso_unique)
+        st.download_button(
+            label="📥 Télécharger Rapprochement_Abonnements_HT_IDF_KN.xlsx (Onglet Unique Consolidé)",
+            data=excel_bytes,
+            file_name="Rapprochement_Abonnements_HT_IDF_KN.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+else:
+    st.info("👈 Importez la **Simulation Achat Artis**, le **Listing des SSC Artis** et vos **4 Annexes Fournisseur** dans le volet de gauche pour lancer l'analyse.")
