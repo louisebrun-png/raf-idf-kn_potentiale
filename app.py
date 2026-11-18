@@ -146,7 +146,6 @@ def get_erp_tech_id(r):
     return ''
 
 def is_internal_depot(dep):
-    """Identifie les dépôts internes suffixés 026159 (ex: AF-KN-Ope 026159_1) facturés sur un autre compte."""
     return '026159' in str(dep or '').strip()
 
 def normalize_depot_simple(dep):
@@ -329,7 +328,7 @@ with st.sidebar:
 st.markdown("# 💼 Potentiale — Outil Métier RAF (Rapprochement Abonnements Fournisseurs)")
 st.markdown(
     "**Fournisseur : Koesio Networks** | Urbanisation SI : Audit Fiscal TVA [STD Standard 20%], "
-    "Exclusion Dépôts Internes (`026159_1`), Priorité Contrats Chiffrés & Conforme 0€"
+    "Réconciliation Haute Précision (ID, Code Client + Article, Alias & Doublons) & Conforme 0€"
 )
 
 with st.expander("📌 Correspondance Dépôts ERP = Factures Fournisseur (Règle d'Urbanisation Potentiale)", expanded=True):
@@ -414,11 +413,10 @@ if file_sim and file_ssc and files_csv:
         )
         sim_valid['Numero_RFC'] = sim_valid['Numero_RFC'].fillna('')
 
-        # --- EXCLUSION DU PÉRIMÈTRE INTERNE (DÉPÔTS CONTENANT 026159) ---
+        # Exclusion périmètre interne 026159
         is_interne_026159 = sim_valid['Depot_Brut'].apply(is_internal_depot)
         sim_interne_exclu = sim_valid[is_interne_026159].copy()
         sim_valid = sim_valid[~is_interne_026159].copy()
-
         sim_valid['Depot_Cible'] = sim_valid['Depot_Brut'].apply(normalize_depot_simple)
 
         # Détection automatique du mois d'étude M et du mois précédent M-1
@@ -470,6 +468,9 @@ if file_sim and file_ssc and files_csv:
             f_list.append(df_c)
 
         f_all = pd.concat(f_list, ignore_index=True)
+        # Exclure également les lignes internes 026159 côté annexe si présentes
+        f_all = f_all[~f_all['Ref. client'].astype(str).str.contains('026159', na=False)].copy()
+
         f_all['Total H.T.'] = pd.to_numeric(f_all['Total H.T.'], errors='coerce').fillna(0.0)
         f_all['P.U. HT'] = pd.to_numeric(f_all['P.U. HT'], errors='coerce').fillna(0.0)
         f_all['Qté'] = pd.to_numeric(f_all['Qté'], errors='coerce').fillna(1.0)
@@ -496,7 +497,7 @@ if file_sim and file_ssc and files_csv:
         sim_err_date = sim_all_rec[sim_all_rec['Statut_Temporel'] == 'Erreur Date Dernier Achat (< M-1)'].copy()
         sim_rec = sim_all_rec[sim_all_rec['Statut_Temporel'] != 'Erreur Date Dernier Achat (< M-1)'].copy()
 
-        # --- 5. MOTEUR DE RÉCONCILIATION AVEC PRIORITÉ CONTRATS CHIFFRÉS (101000xxxx) ---
+        # --- 5. MOTEUR DE RÉCONCILIATION MULTI-PASSES ENRICHI ---
         sim_rec['Tech_ID'] = sim_rec.apply(get_erp_tech_id, axis=1)
         sim_rec['Sub_Client_Code'] = sim_rec['Tech_ID'].apply(norm_client_code)
         sim_rec['Code_Client_ERP_Norm'] = sim_rec['Code client'].apply(norm_client_code)
@@ -586,7 +587,7 @@ if file_sim and file_ssc and files_csv:
                         bind_single_match(si, fi, 'P1b', classify_mismatch_diag(qt_a, deb_e, deb_a))
                         break
 
-            # Passe 2 : Entités Régionales logées dans l'Identifiant Technique (FNTP)
+            # Passe 2 : Entités Régionales logées dans l'Identifiant Technique (FNTP) avec filtrage article/montant cohérent
             f_by_ccode = {}
             for fi in f_idx:
                 if f_abo.at[fi, 'Pass_RAF'] == '':
@@ -601,18 +602,69 @@ if file_sim and file_ssc and files_csv:
                 if not sub_cc or sub_cc not in f_by_ccode:
                     continue
                 s_ht = float(sim_rec.at[si, 'Montant HT'])
-                cand = [fi for fi in f_by_ccode[sub_cc] if f_abo.at[fi, 'Pass_RAF'] == '' and float(f_abo.at[fi, 'Total H.T.']) > 0]
+                art_s = sim_rec.at[si, 'Art_Num']
+                cand = [fi for fi in f_by_ccode[sub_cc] if f_abo.at[fi, 'Pass_RAF'] == '' and float(f_abo.at[fi, 'Total H.T.']) >= 10.0]
                 if not cand:
                     continue
                 exact_c = [fi for fi in cand if abs(s_ht - float(f_abo.at[fi, 'Total H.T.'])) <= 0.05]
+                same_art_c = [fi for fi in cand if f_abo.at[fi, 'Art_Num'] == art_s]
                 if exact_c:
                     bind_single_match(si, exact_c[0], 'P2_Reg', 'Conforme')
+                elif same_art_c:
+                    fi = same_art_c[0]
+                    qt_a = float(f_abo.at[fi, 'Qté'])
+                    bind_single_match(si, fi, 'P2_Reg', classify_mismatch_diag(qt_a, sim_rec.at[si, 'Deb_ERP_Fmt'], f_abo.at[fi, 'Deb_Annexe_Fmt']))
                 else:
                     fi = cand[0]
                     qt_a = float(f_abo.at[fi, 'Qté'])
                     bind_single_match(si, fi, 'P2_Reg', classify_mismatch_diag(qt_a, sim_rec.at[si, 'Deb_ERP_Fmt'], f_abo.at[fi, 'Deb_Annexe_Fmt']))
 
-            # Passe 3 : Alias Client + Code Article Numérique (KNxxxx == xxxx) + Période (Mois)
+            # Passe 3a : Code Client Strict Identique + Code Article Numérique (KNxxxx == xxxx) + Période (ex: NS_001967, CO_7526)
+            s_rem3a = [si for si in s_idx if sim_rec.at[si, 'Pass_RAF'] == '' and sim_rec.at[si, 'Code_Client_ERP_Norm'] != '' and sim_rec.at[si, 'Art_Num'] not in ('', '2912')]
+            f_rem_code_am = {}
+            for fi in f_idx:
+                if f_abo.at[fi, 'Pass_RAF'] == '' and f_abo.at[fi, 'Code_Client_Fourn_Norm'] != '':
+                    key = (f_abo.at[fi, 'Code_Client_Fourn_Norm'], f_abo.at[fi, 'Art_Num'], f_abo.at[fi, 'YM_Annexe'])
+                    f_rem_code_am.setdefault(key, []).append(fi)
+            s_by_code_am = {}
+            for si in s_rem3a:
+                key = (sim_rec.at[si, 'Code_Client_ERP_Norm'], sim_rec.at[si, 'Art_Num'], sim_rec.at[si, 'YM_ERP'])
+                s_by_code_am.setdefault(key, []).append(si)
+
+            for key, sis in s_by_code_am.items():
+                if key not in f_rem_code_am:
+                    continue
+                matched_fis = [fi for fi in f_rem_code_am[key] if f_abo.at[fi, 'Pass_RAF'] == '']
+                if not matched_fis:
+                    continue
+                sum_s = sum(float(sim_rec.at[si, 'Montant HT']) for si in sis)
+                sum_f = sum(float(f_abo.at[fi, 'Total H.T.']) for fi in matched_fis)
+                sum_qf = sum(float(f_abo.at[fi, 'Qté']) for fi in matched_fis)
+                is_exact = abs(sum_s - sum_f) <= 0.10
+                first_fi = matched_fis[0]
+                deb_a = f_abo.at[first_fi, 'Deb_Annexe_Fmt']
+                fin_a = f_abo.at[first_fi, 'Fin_Annexe_Fmt']
+                for si in sis:
+                    s_ht = float(sim_rec.at[si, 'Montant HT'])
+                    ratio = (s_ht / sum_s) if sum_s > 0 else (1.0 / len(sis))
+                    qt_alloc = round(sum_qf * ratio, 2)
+                    deb_e = sim_rec.at[si, 'Deb_ERP_Fmt']
+                    diag_lbl = 'Conforme' if is_exact else classify_mismatch_diag(qt_alloc, deb_e, deb_a)
+                    sim_rec.at[si, 'Pass_RAF'] = 'P3a'
+                    sim_rec.at[si, 'Diagnostic'] = diag_lbl
+                    sim_rec.at[si, 'Code_Client_Annexe'] = str(f_abo.at[first_fi, 'Ref. client'] or '')
+                    sim_rec.at[si, 'Client_Annexe'] = str(f_abo.at[first_fi, 'Client final'] or '')
+                    sim_rec.at[si, 'Libelle_Annexe'] = str(f_abo.at[first_fi, 'Libellé produit'] or '')
+                    sim_rec.at[si, 'Ref_Produit_Annexe'] = str(f_abo.at[first_fi, 'Réf. produit'] or '')
+                    sim_rec.at[si, 'Deb_Annexe'] = deb_a
+                    sim_rec.at[si, 'Fin_Annexe'] = fin_a
+                    sim_rec.at[si, 'Qt_Annexe'] = qt_alloc
+                    sim_rec.at[si, 'PU_Annexe'] = float(f_abo.at[first_fi, 'P.U. HT'])
+                    sim_rec.at[si, 'Montant_Annexe_HT'] = round(sum_f * ratio, 2)
+                for fi in matched_fis:
+                    f_abo.at[fi, 'Pass_RAF'] = 'P3a'
+
+            # Passe 3b : Alias Client + Code Article Numérique (KNxxxx == xxxx) + Période (Mois)
             s_rem = [si for si in s_idx if sim_rec.at[si, 'Pass_RAF'] == '' and sim_rec.at[si, 'Art_Num'] not in ('', '2912')]
             f_rem_cam = {}
             for fi in f_idx:
@@ -644,7 +696,7 @@ if file_sim and file_ssc and files_csv:
                     qt_alloc = round(sum_qf * ratio, 2)
                     deb_e = sim_rec.at[si, 'Deb_ERP_Fmt']
                     diag_lbl = 'Conforme' if is_exact else classify_mismatch_diag(qt_alloc, deb_e, deb_a)
-                    sim_rec.at[si, 'Pass_RAF'] = 'P3'
+                    sim_rec.at[si, 'Pass_RAF'] = 'P3b'
                     sim_rec.at[si, 'Diagnostic'] = diag_lbl
                     sim_rec.at[si, 'Code_Client_Annexe'] = str(f_abo.at[first_fi, 'Ref. client'] or '')
                     sim_rec.at[si, 'Client_Annexe'] = str(f_abo.at[first_fi, 'Client final'] or '')
@@ -656,7 +708,7 @@ if file_sim and file_ssc and files_csv:
                     sim_rec.at[si, 'PU_Annexe'] = float(f_abo.at[first_fi, 'P.U. HT'])
                     sim_rec.at[si, 'Montant_Annexe_HT'] = round(sum_f * ratio, 2)
                 for fi in matched_fis:
-                    f_abo.at[fi, 'Pass_RAF'] = 'P3'
+                    f_abo.at[fi, 'Pass_RAF'] = 'P3b'
 
             # Passe 4 : Alias Client + Libellé Produit + Période (absorbe la reprise KN2912)
             s_rem4 = [si for si in s_idx if sim_rec.at[si, 'Pass_RAF'] == '']
@@ -704,7 +756,7 @@ if file_sim and file_ssc and files_csv:
                 for fi in matched_fis:
                     f_abo.at[fi, 'Pass_RAF'] = 'P4'
 
-            # Passe 5 : Code Client Exact Identique (Code Client ERP == Ref. client Annexe) + Libellé Produit + Période
+            # Passe 5 : Code Client Exact Identique + Libellé Produit + Période
             s_rem5 = [si for si in s_idx if sim_rec.at[si, 'Pass_RAF'] == '' and sim_rec.at[si, 'Code_Client_ERP_Norm'] != '']
             f_rem_code_pm = {}
             for fi in f_idx:
@@ -749,19 +801,25 @@ if file_sim and file_ssc and files_csv:
                 for fi in matched_fis:
                     f_abo.at[fi, 'Pass_RAF'] = 'P5'
 
-        # --- 6. RÈGLE DE PRIORITÉ DOUBLONS & QUALIFICATION CODE CLIENT 10 (HORS 026159_1) ---
+        # --- 6. RÈGLE DE PRIORITÉ DOUBLONS (UNITAIRES + GROUPÉS) & QUALIFICATION CODE CLIENT 10 ---
         conforme_rows = sim_rec[sim_rec['Diagnostic'] == 'Conforme']
         conforme_signatures = set(zip(
             conforme_rows['Depot_Cible'],
             conforme_rows['Client_Norm'],
             conforme_rows['Montant HT'].round(2)
         ))
+        # Somme déjà rapprochée en 'Conforme' par (Dépôt, Client, Article) pour détecter les doublons groupés (ex: Qté 31 = 208.32 €)
+        conforme_grouped_sums = conforme_rows.groupby(['Depot_Cible', 'Client_Norm', 'Art_Num'])['Montant HT'].sum().round(2).to_dict()
 
         for si in sim_rec[sim_rec['Pass_RAF'] == ''].index:
             code_cli_str = str(sim_rec.at[si, 'Code client']).strip()
-            sig = (sim_rec.at[si, 'Depot_Cible'], sim_rec.at[si, 'Client_Norm'], round(float(sim_rec.at[si, 'Montant HT']), 2))
+            m_ht = round(float(sim_rec.at[si, 'Montant HT']), 2)
+            sig = (sim_rec.at[si, 'Depot_Cible'], sim_rec.at[si, 'Client_Norm'], m_ht)
+            grp_key = (sim_rec.at[si, 'Depot_Cible'], sim_rec.at[si, 'Client_Norm'], sim_rec.at[si, 'Art_Num'])
 
-            if sig in conforme_signatures:
+            is_dup = (sig in conforme_signatures) or (grp_key in conforme_grouped_sums and abs(conforme_grouped_sums[grp_key] - m_ht) <= 0.10)
+
+            if is_dup:
                 if not sim_rec.at[si, 'Is_Digit_SSC']:
                     sim_rec.at[si, 'Diagnostic'] = 'Doublon — Supprimer AFIDF (Contrat chiffré actif)'
                 else:
