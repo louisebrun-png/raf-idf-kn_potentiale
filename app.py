@@ -146,6 +146,7 @@ def get_erp_tech_id(r):
     return ''
 
 def is_internal_depot(dep):
+    """Exclut UNIQUEMENT les lignes dont le code dépôt contient 026159. Tout autre dépôt est conservé."""
     return '026159' in str(dep or '').strip()
 
 def normalize_depot_simple(dep):
@@ -194,6 +195,15 @@ def classify_mismatch_diag(qt_annexe, deb_erp_str, deb_annexe_str):
         return 'Problème de prorata et/ou de prix'
     return 'Écart Prix / Quantité'
 
+def diag_priority_rank(diag_str):
+    """Place toutes les anomalies/actions en haut (rang 0) et relègue 'Conforme' (rang 1) et 'Conforme 0€' (rang 2) tout en bas."""
+    d = str(diag_str or '').strip()
+    if d == 'Conforme 0€':
+        return 2
+    if d == 'Conforme':
+        return 1
+    return 0
+
 def compute_article_correction(row):
     art_erp = str(row.get('Code Article ERP', '')).strip().upper()
     ref_annexe = str(row.get('Réf. Produit Annexe', '')).strip().upper()
@@ -202,13 +212,13 @@ def compute_article_correction(row):
 
     if diag == 'Conforme 0€':
         return "Aucune action (0,00 €)"
-    if 'Ref. client à faire changer chez KN' in diag:
+    if diag == 'Dossier lié via Numéro SSC':
         mda = to_mda_article(ref_annexe)
         if mda and not art_erp:
-            return f"Changer Ref. client chez KN -> {code_cli_erp} + Créer {mda}"
-        return f"Changer Ref. client chez KN -> {code_cli_erp}"
-    if 'Code 10 — Dépôt 026159_1 manquant' in diag:
-        return "Affecter dépôt 026159_1 OU rattacher au client final"
+            return f"Corriger Ref. client partenaire -> {code_cli_erp} + Créer {mda}"
+        return f"Pointer ce client (Ref. client partenaire à corriger -> {code_cli_erp})"
+    if 'Interne / Non attribué (Code 10)' in diag:
+        return "Basculer sur dépôt 026159_1 OU rattacher au client final"
     if 'Doublon — Supprimer AFIDF' in diag:
         return "Fermer ligne AFIDF (Conserver contrat chiffré)"
     if 'Doublon — Conserver contrat chiffré' in diag:
@@ -219,7 +229,7 @@ def compute_article_correction(row):
         mda = to_mda_article(ref_annexe)
         return f"Créer / Saisir avec {mda}" if mda else "À créer / saisir"
     if not ref_annexe:
-        return "À vérifier (Absent annexe)"
+        return "Pointer ce client (Absent annexe)"
 
     mda_cible = to_mda_article(ref_annexe)
     num_erp = extract_art_num(art_erp)
@@ -262,7 +272,7 @@ def build_single_tab_excel(df_export):
     ws.row_dimensions[1].height = 26
 
     diag_col_idx = list(df_export.columns).index('Diagnostic')
-    art_corr_col_idx = list(df_export.columns).index('Code Article à Corriger (MDA)')
+    art_corr_col_idx = list(df_export.columns).index('Action / Code Article à Corriger (MDA)')
 
     for ri, row in enumerate(df_export.itertuples(index=False), start=2):
         ws.row_dimensions[ri].height = 20
@@ -281,21 +291,21 @@ def build_single_tab_excel(df_export):
                 c.font = font_bold
                 if diag_val in ('Conforme', 'Conforme 0€'):
                     c.fill = fill_ok
-                elif 'Code 10' in diag_val:
+                elif 'Interne / Non attribué' in diag_val:
                     c.fill = fill_neutral
                 elif 'Manquant' in diag_val or 'Erreur date' in diag_val or 'Doublon' in diag_val:
                     c.fill = fill_err
                 elif 'Régul.' in diag_val:
                     c.fill = fill_regul
-                elif 'prorata' in diag_val or 'Ref. client' in diag_val:
+                elif 'prorata' in diag_val or diag_val == 'Dossier lié via Numéro SSC':
                     c.fill = fill_prorata
                 else:
                     c.fill = fill_warn
-            elif col_name == 'Code Article à Corriger (MDA)':
+            elif col_name == 'Action / Code Article à Corriger (MDA)':
                 c.font = font_bold
                 if art_corr_val in ('OK', 'Aucune action (0,00 €)'):
                     c.fill = fill_ok
-                elif any(k in art_corr_val for k in ['Remplacer', 'Créer', 'Corriger', 'Fermer', 'Affecter', 'Changer']):
+                else:
                     c.fill = fill_warn
 
             if isinstance(val, (int, float)) and not isinstance(val, bool):
@@ -312,7 +322,7 @@ def build_single_tab_excel(df_export):
 
     for ci, col_name in enumerate(df_export.columns, start=1):
         max_len = max([len(str(col_name))] + [len(str(x)) for x in df_export.iloc[:, ci - 1].head(150)])
-        ws.column_dimensions[get_column_letter(ci)].width = min(max(max_len + 4, 14), 52)
+        ws.column_dimensions[get_column_letter(ci)].width = min(max(max_len + 4, 14), 54)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -334,14 +344,14 @@ with st.sidebar:
 st.markdown("# 💼 Potentiale — Outil Métier RAF (Rapprochement Abonnements Fournisseurs)")
 st.markdown(
     "**Fournisseur : Koesio Networks** | Urbanisation SI : Audit Fiscal TVA [STD Standard 20%], "
-    "Regroupement par Numéro SSC (`Ref. client à corriger`), Priorité Contrats Chiffrés & Conforme 0€"
+    "Exclusion Stricte Dépôt 026159, Priorité Contrats Chiffrés & Tri Anomalies en Tête"
 )
 
 with st.expander("📌 Correspondance Dépôts ERP = Factures Fournisseur (Règle d'Urbanisation Potentiale)", expanded=True):
     col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-    col_m1.info("**`AF-KN-Ope`**\n\n= **Facture Abonnements Opérateur**\n\n*(Hors dépôt interne 026159_1)*")
-    col_m2.info("**`AF-KN-MOB`**\n\n= **Facture Forfaits Mobiles**\n\n*(Hors dépôt interne 026159_1)*")
-    col_m3.info("**`AF-KN-Heberg`**\n\n= **Facture Abonnements Hébergement**\n\n*(Hors dépôt interne 026159_1)*")
+    col_m1.info("**`AF-KN-Ope`**\n\n= **Facture Abonnements Opérateur**\n\n*(Tout dépôt autre que 026159 conservé)*")
+    col_m2.info("**`AF-KN-MOB`**\n\n= **Facture Forfaits Mobiles**\n\n*(Tout dépôt autre que 026159 conservé)*")
+    col_m3.info("**`AF-KN-Heberg`**\n\n= **Facture Abonnements Hébergement**\n\n*(Tout dépôt autre que 026159 conservé)*")
     col_m4.warning("**`Flux Ponctuels (FAS)`**\n\n= **Facture Frais de Mise en Service**\n\n*(Pointage BL hors récurrent)*")
 
 st.markdown("---")
@@ -382,7 +392,6 @@ if file_sim and file_ssc and files_csv:
         rfc_code_map = ssc_dedup.set_index(['Code SSC', 'Libellé RFC'])['Code RFC'].to_dict() if 'Code RFC' in ssc_dedup.columns else {}
         charge_map = ssc_dedup.set_index(['Code SSC', 'Libellé RFC'])['Nom chargé factu SSC'].to_dict() if 'Nom chargé factu SSC' in ssc_dedup.columns else {}
 
-        # Référentiel Numéro SSC -> (Code Client ERP, Client ERP, Chargé Factu) pour regrouper les annexes où Ref. client = Numéro SSC
         ssc_to_client_map = {}
         for _, r_ssc in ssc_active.drop_duplicates(subset=['Code SSC']).iterrows():
             c_ssc = str(r_ssc.get('Code SSC', '')).strip()
@@ -430,10 +439,9 @@ if file_sim and file_ssc and files_csv:
         )
         sim_valid['Numero_RFC'] = sim_valid['Numero_RFC'].fillna('')
 
-        # Exclusion périmètre interne 026159
-        is_interne_026159 = sim_valid['Depot_Brut'].apply(is_internal_depot)
-        sim_interne_exclu = sim_valid[is_interne_026159].copy()
-        sim_valid = sim_valid[~is_interne_026159].copy()
+        # Exclusion UNIQUEMENT des lignes dont le code dépôt contient 026159
+        mask_interne_erp = sim_valid['Depot_Brut'].apply(is_internal_depot)
+        sim_valid = sim_valid[~mask_interne_erp].copy()
         sim_valid['Depot_Cible'] = sim_valid['Depot_Brut'].apply(normalize_depot_simple)
 
         # Détection automatique du mois d'étude M et du mois précédent M-1
@@ -485,7 +493,7 @@ if file_sim and file_ssc and files_csv:
             f_list.append(df_c)
 
         f_all = pd.concat(f_list, ignore_index=True)
-        f_all = f_all[~f_all['Ref. client'].astype(str).str.contains('026159', na=False)].copy()
+        f_all = f_all[~f_all['Ref. client'].apply(is_internal_depot)].copy()
 
         f_all['Total H.T.'] = pd.to_numeric(f_all['Total H.T.'], errors='coerce').fillna(0.0)
         f_all['P.U. HT'] = pd.to_numeric(f_all['P.U. HT'], errors='coerce').fillna(0.0)
@@ -848,7 +856,7 @@ if file_sim and file_ssc and files_csv:
                 if matched_fi is not None:
                     bind_single_match(si, matched_fi, 'P6_Tarif', 'Conforme')
 
-        # --- 6. RÈGLE DE PRIORITÉ DOUBLONS & REGROUPEMENT PAR NUMÉRO SSC == CODE CLIENT ANNEXE ---
+        # --- 6. RÈGLE DE PRIORITÉ DOUBLONS, REGROUPEMENT PAR SSC (CATÉGORIE UNIQUE) & CODE 10 ---
         conforme_rows = sim_rec[sim_rec['Diagnostic'] == 'Conforme']
         conforme_signatures = set(zip(
             conforme_rows['Depot_Cible'],
@@ -857,7 +865,6 @@ if file_sim and file_ssc and files_csv:
         ))
         conforme_grouped_sums = conforme_rows.groupby(['Depot_Cible', 'Client_Norm', 'Art_Num'])['Montant HT'].sum().round(2).to_dict()
 
-        # Identifier les Numéros SSC qui ont été saisis par erreur dans Ref. client chez le fournisseur (ex: AS TALENTS 1010009802)
         f_unmatched_ssc_refs = set(
             f_abo[f_abo['Pass_RAF'] == '']['Ref. client'].dropna().astype(str).str.strip()
         ).intersection(set(ssc_to_client_map.keys()))
@@ -877,9 +884,10 @@ if file_sim and file_ssc and files_csv:
                 else:
                     sim_rec.at[si, 'Diagnostic'] = 'Doublon — Conserver contrat chiffré (Fermer AFIDF)'
             elif num_ssc_str in f_unmatched_ssc_refs:
-                sim_rec.at[si, 'Diagnostic'] = f'Dossier lié via Numéro SSC — Ref. client à faire changer chez KN ({code_cli_str})'
+                # Catégorie strictement unique pour l'écran de synthèse et le fichier
+                sim_rec.at[si, 'Diagnostic'] = 'Dossier lié via Numéro SSC'
             elif code_cli_str == '10':
-                sim_rec.at[si, 'Diagnostic'] = 'Code 10 — Dépôt 026159_1 manquant ou non attribué client'
+                sim_rec.at[si, 'Diagnostic'] = 'Interne / Non attribué (Code 10)'
 
         # Construction du tableau unique consolidé
         df_part_erp = pd.DataFrame({
@@ -981,8 +989,7 @@ if file_sim and file_ssc and files_csv:
             'Diagnostic': f'Régul. fournisseur < {mois_m1_label} (Variable sur facture)'
         })
 
-        # Lignes fournisseur non rapprochées :
-        # Si Ref. client == Numéro SSC connu -> rattachement automatique au dossier ERP avec consigne 'Ref. client à faire changer chez KN'
+        # Lignes fournisseur non rapprochées
         f_unmatched = f_abo[f_abo['Pass_RAF'] == ''].copy()
 
         def enrich_fourn_unmatched(r):
@@ -998,7 +1005,7 @@ if file_sim and file_ssc and files_csv:
                     c_erp,
                     info['client_erp'],
                     ref_cli,
-                    f'Dossier lié via Numéro SSC — Ref. client à faire changer chez KN ({c_erp})'
+                    'Dossier lié via Numéro SSC'
                 ])
             return pd.Series(['', '', '', '', 'Manquant erp'])
 
@@ -1034,12 +1041,14 @@ if file_sim and file_ssc and files_csv:
         })
 
         df_conso_unique = pd.concat([df_part_erp, df_part_err_date, df_part_f_regul, df_part_fourn], ignore_index=True)
-        df_conso_unique['Code Article à Corriger (MDA)'] = df_conso_unique.apply(compute_article_correction, axis=1)
+        df_conso_unique['Action / Code Article à Corriger (MDA)'] = df_conso_unique.apply(compute_article_correction, axis=1)
 
+        # Tri hiérarchique : Anomalies / Actions EN HAUT (rang 0), Conforme (rang 1) et Conforme 0€ (rang 2) TOUT EN BAS
+        df_conso_unique['_rank'] = df_conso_unique['Diagnostic'].apply(diag_priority_rank)
         df_conso_unique = df_conso_unique.sort_values(
-            by=['Code Dépôt (Origine Facture)', 'Client ERP', 'Numéro SSC', 'Diagnostic', 'Client Annexe', 'Numéro RFC', 'Début Période ERP'],
-            ascending=[True, True, True, True, True, True, True]
-        )
+            by=['_rank', 'Code Dépôt (Origine Facture)', 'Client ERP', 'Numéro SSC', 'Diagnostic', 'Client Annexe', 'Numéro RFC', 'Début Période ERP'],
+            ascending=[True, True, True, True, True, True, True, True]
+        ).drop(columns=['_rank'])
 
         # ======================================================================
         # NAVIGATION EN 4 ONGLETS MÉTIERS (STANDARD POTENTIALE)
@@ -1083,13 +1092,6 @@ if file_sim and file_ssc and files_csv:
         # ONGLET 2 : ABONNEMENTS RÉCURRENTS HT
         # ----------------------------------------------------------------------
         with tab2:
-            if not sim_interne_exclu.empty:
-                st.info(
-                    f"ℹ️ **Périmètre Interne Exclu (`Dépôts 026159`) :** {len(sim_interne_exclu)} ligne(s) rattachées aux dépôts internes "
-                    f"(`AF-KN-Ope 026159_1`, `AF-KN-MOB 026159_1`, `AF-KN-Heberg 026159_1`) pour un total de **{sim_interne_exclu['Montant HT'].sum():,.2f} € HT** "
-                    "ont été automatiquement exclues de ce rapprochement (facturées sur un autre compte)."
-                )
-
             st.markdown(f"## ⏳ Audit de Temporalité ERP (Clôture {mois_detecte} — Prorata {mois_m1_label} Admis)")
             t1, t2, t3, t4 = st.columns(4)
             t1.metric(f"🟢 Mois Courant ({mois_detecte})", f"{nb_m} lignes")
@@ -1098,7 +1100,7 @@ if file_sim and file_ssc and files_csv:
             t4.metric("⏳ Anomalies Modules / Dates", f"{nb_retards} lignes")
 
             st.markdown("---")
-            st.markdown(f"## 🧮 Synthèse Macro-Financière HT (Périmètre {mois_detecte} & {mois_m1_label} Hors Interne 026159)")
+            st.markdown(f"## 🧮 Synthèse Macro-Financière HT (Périmètre {mois_detecte} & {mois_m1_label} Hors Dépôt 026159)")
 
             tot_sim_perimetre_ht = sim_rec['Montant HT'].sum()
             tot_err_date_ht = sim_err_date['Montant HT'].sum()
@@ -1156,13 +1158,15 @@ if file_sim and file_ssc and files_csv:
             st.dataframe(df_comp_dep, use_container_width=True, hide_index=True)
 
             st.markdown("---")
-            st.markdown("### 📊 Bilan Volumétrique Assaini du Rapprochement (Prêt à Exploiter dans Excel)")
+            st.markdown("### 📊 Bilan Volumétrique Assaini du Rapprochement (Anomalies en Haut, Conformes & 0€ en Bas)")
             diag_counts = df_conso_unique.groupby('Diagnostic', as_index=False).agg(
                 Nombre_Lignes=('Diagnostic', 'count'),
                 Montant_ERP_HT=('Montant ERP HT', 'sum'),
                 Montant_Annexe_HT=('Montant Annexe HT', 'sum'),
                 Ecart_HT=('Écart HT (+ / -)', 'sum')
             )
+            diag_counts['_rank'] = diag_counts['Diagnostic'].apply(diag_priority_rank)
+            diag_counts = diag_counts.sort_values(by=['_rank', 'Diagnostic'], ascending=[True, True]).drop(columns=['_rank'])
             st.dataframe(diag_counts, use_container_width=True, hide_index=True)
 
         # ----------------------------------------------------------------------
