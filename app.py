@@ -198,9 +198,15 @@ def compute_article_correction(row):
     art_erp = str(row.get('Code Article ERP', '')).strip().upper()
     ref_annexe = str(row.get('Réf. Produit Annexe', '')).strip().upper()
     diag = str(row.get('Diagnostic', '')).strip()
+    code_cli_erp = str(row.get('Code Client ERP', '')).strip()
 
     if diag == 'Conforme 0€':
         return "Aucune action (0,00 €)"
+    if 'Ref. client à faire changer chez KN' in diag:
+        mda = to_mda_article(ref_annexe)
+        if mda and not art_erp:
+            return f"Changer Ref. client chez KN -> {code_cli_erp} + Créer {mda}"
+        return f"Changer Ref. client chez KN -> {code_cli_erp}"
     if 'Code 10 — Dépôt 026159_1 manquant' in diag:
         return "Affecter dépôt 026159_1 OU rattacher au client final"
     if 'Doublon — Supprimer AFIDF' in diag:
@@ -281,7 +287,7 @@ def build_single_tab_excel(df_export):
                     c.fill = fill_err
                 elif 'Régul.' in diag_val:
                     c.fill = fill_regul
-                elif 'prorata' in diag_val:
+                elif 'prorata' in diag_val or 'Ref. client' in diag_val:
                     c.fill = fill_prorata
                 else:
                     c.fill = fill_warn
@@ -289,7 +295,7 @@ def build_single_tab_excel(df_export):
                 c.font = font_bold
                 if art_corr_val in ('OK', 'Aucune action (0,00 €)'):
                     c.fill = fill_ok
-                elif any(k in art_corr_val for k in ['Remplacer', 'Créer', 'Corriger', 'Fermer', 'Affecter']):
+                elif any(k in art_corr_val for k in ['Remplacer', 'Créer', 'Corriger', 'Fermer', 'Affecter', 'Changer']):
                     c.fill = fill_warn
 
             if isinstance(val, (int, float)) and not isinstance(val, bool):
@@ -306,7 +312,7 @@ def build_single_tab_excel(df_export):
 
     for ci, col_name in enumerate(df_export.columns, start=1):
         max_len = max([len(str(col_name))] + [len(str(x)) for x in df_export.iloc[:, ci - 1].head(150)])
-        ws.column_dimensions[get_column_letter(ci)].width = min(max(max_len + 4, 14), 50)
+        ws.column_dimensions[get_column_letter(ci)].width = min(max(max_len + 4, 14), 52)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -328,7 +334,7 @@ with st.sidebar:
 st.markdown("# 💼 Potentiale — Outil Métier RAF (Rapprochement Abonnements Fournisseurs)")
 st.markdown(
     "**Fournisseur : Koesio Networks** | Urbanisation SI : Audit Fiscal TVA [STD Standard 20%], "
-    "Réconciliation Haute Précision (6 Passes), Priorité Contrats Chiffrés & Conforme 0€"
+    "Regroupement par Numéro SSC (`Ref. client à corriger`), Priorité Contrats Chiffrés & Conforme 0€"
 )
 
 with st.expander("📌 Correspondance Dépôts ERP = Factures Fournisseur (Règle d'Urbanisation Potentiale)", expanded=True):
@@ -370,11 +376,22 @@ if file_sim and file_ssc and files_csv:
             ssc_tva = pd.DataFrame()
             anomalies_tva = pd.DataFrame()
 
-        # --- 2. LECTURE DYNAMIQUE DES DÉPÔTS & NUMÉROS RFC DEPUIS SSC ---
+        # --- 2. LECTURE DYNAMIQUE DES DÉPÔTS, NUMÉROS RFC & TABLE SSC -> CLIENT ---
         ssc_dedup = ssc_active.drop_duplicates(subset=['Code SSC', 'Libellé RFC'])
         depot_map = ssc_dedup.set_index(['Code SSC', 'Libellé RFC'])['Abonnement Code dépôt'].to_dict()
         rfc_code_map = ssc_dedup.set_index(['Code SSC', 'Libellé RFC'])['Code RFC'].to_dict() if 'Code RFC' in ssc_dedup.columns else {}
         charge_map = ssc_dedup.set_index(['Code SSC', 'Libellé RFC'])['Nom chargé factu SSC'].to_dict() if 'Nom chargé factu SSC' in ssc_dedup.columns else {}
+
+        # Référentiel Numéro SSC -> (Code Client ERP, Client ERP, Chargé Factu) pour regrouper les annexes où Ref. client = Numéro SSC
+        ssc_to_client_map = {}
+        for _, r_ssc in ssc_active.drop_duplicates(subset=['Code SSC']).iterrows():
+            c_ssc = str(r_ssc.get('Code SSC', '')).strip()
+            if c_ssc:
+                ssc_to_client_map[c_ssc] = {
+                    'code_client': str(r_ssc.get('Code client', '') or '').strip(),
+                    'client_erp': str(r_ssc.get('Raison sociale client', '') or '').strip(),
+                    'charge_factu': str(r_ssc.get('Nom chargé factu SSC', '') or '').strip()
+                }
 
         ssc_active['k_norm'] = (
             ssc_active['Code SSC'].astype(str).str.strip() + "||" +
@@ -800,7 +817,7 @@ if file_sim and file_ssc and files_csv:
                 for fi in matched_fis:
                     f_abo.at[fi, 'Pass_RAF'] = 'P5'
 
-            # Passe 6 : Même Client (ou Code Client) + Même Montant HT Exact sur le même Dépôt (absorbe les changements de référence produit à tarif identique)
+            # Passe 6 : Même Client (ou Code Client) + Même Montant HT Exact sur le même Dépôt
             f_by_client_ht = {}
             for fi in f_idx:
                 if f_abo.at[fi, 'Pass_RAF'] == '' and float(f_abo.at[fi, 'Total H.T.']) > 0:
@@ -831,7 +848,7 @@ if file_sim and file_ssc and files_csv:
                 if matched_fi is not None:
                     bind_single_match(si, matched_fi, 'P6_Tarif', 'Conforme')
 
-        # --- 6. RÈGLE DE PRIORITÉ DOUBLONS (UNITAIRES + GROUPÉS) & QUALIFICATION CODE CLIENT 10 ---
+        # --- 6. RÈGLE DE PRIORITÉ DOUBLONS & REGROUPEMENT PAR NUMÉRO SSC == CODE CLIENT ANNEXE ---
         conforme_rows = sim_rec[sim_rec['Diagnostic'] == 'Conforme']
         conforme_signatures = set(zip(
             conforme_rows['Depot_Cible'],
@@ -840,8 +857,14 @@ if file_sim and file_ssc and files_csv:
         ))
         conforme_grouped_sums = conforme_rows.groupby(['Depot_Cible', 'Client_Norm', 'Art_Num'])['Montant HT'].sum().round(2).to_dict()
 
+        # Identifier les Numéros SSC qui ont été saisis par erreur dans Ref. client chez le fournisseur (ex: AS TALENTS 1010009802)
+        f_unmatched_ssc_refs = set(
+            f_abo[f_abo['Pass_RAF'] == '']['Ref. client'].dropna().astype(str).str.strip()
+        ).intersection(set(ssc_to_client_map.keys()))
+
         for si in sim_rec[sim_rec['Pass_RAF'] == ''].index:
             code_cli_str = str(sim_rec.at[si, 'Code client']).strip()
+            num_ssc_str = str(sim_rec.at[si, 'Code SSC']).strip()
             m_ht = round(float(sim_rec.at[si, 'Montant HT']), 2)
             sig = (sim_rec.at[si, 'Depot_Cible'], sim_rec.at[si, 'Client_Norm'], m_ht)
             grp_key = (sim_rec.at[si, 'Depot_Cible'], sim_rec.at[si, 'Client_Norm'], sim_rec.at[si, 'Art_Num'])
@@ -853,6 +876,8 @@ if file_sim and file_ssc and files_csv:
                     sim_rec.at[si, 'Diagnostic'] = 'Doublon — Supprimer AFIDF (Contrat chiffré actif)'
                 else:
                     sim_rec.at[si, 'Diagnostic'] = 'Doublon — Conserver contrat chiffré (Fermer AFIDF)'
+            elif num_ssc_str in f_unmatched_ssc_refs:
+                sim_rec.at[si, 'Diagnostic'] = f'Dossier lié via Numéro SSC — Ref. client à faire changer chez KN ({code_cli_str})'
             elif code_cli_str == '10':
                 sim_rec.at[si, 'Diagnostic'] = 'Code 10 — Dépôt 026159_1 manquant ou non attribué client'
 
@@ -956,20 +981,38 @@ if file_sim and file_ssc and files_csv:
             'Diagnostic': f'Régul. fournisseur < {mois_m1_label} (Variable sur facture)'
         })
 
-        # Lignes fournisseur non rapprochées : distinction entre 'Conforme 0€' et 'Manquant erp'
+        # Lignes fournisseur non rapprochées :
+        # Si Ref. client == Numéro SSC connu -> rattachement automatique au dossier ERP avec consigne 'Ref. client à faire changer chez KN'
         f_unmatched = f_abo[f_abo['Pass_RAF'] == ''].copy()
-        f_unmatched['Diag_Fourn'] = f_unmatched['Total H.T.'].apply(
-            lambda v: 'Conforme 0€' if abs(float(v)) < 0.005 else 'Manquant erp'
-        )
+
+        def enrich_fourn_unmatched(r):
+            ref_cli = str(r.get('Ref. client') or '').strip()
+            tot_ht = float(r.get('Total H.T.', 0.0))
+            if abs(tot_ht) < 0.005:
+                return pd.Series(['', '', '', '', 'Conforme 0€'])
+            if ref_cli in ssc_to_client_map:
+                info = ssc_to_client_map[ref_cli]
+                c_erp = info['code_client']
+                return pd.Series([
+                    info['charge_factu'],
+                    c_erp,
+                    info['client_erp'],
+                    ref_cli,
+                    f'Dossier lié via Numéro SSC — Ref. client à faire changer chez KN ({c_erp})'
+                ])
+            return pd.Series(['', '', '', '', 'Manquant erp'])
+
+        f_unmatched[['Charge_Link', 'Code_Cli_Link', 'Client_ERP_Link', 'Num_SSC_Link', 'Diag_Fourn']] = f_unmatched.apply(enrich_fourn_unmatched, axis=1)
+
         df_part_fourn = pd.DataFrame({
             'Code Dépôt (Origine Facture)': f_unmatched['Depot_Fourn'],
             'Facture Associée': f_unmatched['Facture_Label'],
-            'Chargé Factu': '',
-            'Code Client ERP': '',
+            'Chargé Factu': f_unmatched['Charge_Link'],
+            'Code Client ERP': f_unmatched['Code_Cli_Link'],
             'Code Client Annexe': f_unmatched['Ref. client'].fillna(''),
-            'Client ERP': '',
+            'Client ERP': f_unmatched['Client_ERP_Link'],
             'Client Annexe': f_unmatched['Client final'].fillna(''),
-            'Numéro SSC': '',
+            'Numéro SSC': f_unmatched['Num_SSC_Link'],
             'Numéro RFC': '',
             'Code Article ERP': '',
             'Réf. Produit Annexe': f_unmatched['Réf. produit'].fillna(''),
@@ -994,8 +1037,8 @@ if file_sim and file_ssc and files_csv:
         df_conso_unique['Code Article à Corriger (MDA)'] = df_conso_unique.apply(compute_article_correction, axis=1)
 
         df_conso_unique = df_conso_unique.sort_values(
-            by=['Code Dépôt (Origine Facture)', 'Diagnostic', 'Client ERP', 'Client Annexe', 'Numéro RFC', 'Début Période ERP'],
-            ascending=[True, True, True, True, True, True]
+            by=['Code Dépôt (Origine Facture)', 'Client ERP', 'Numéro SSC', 'Diagnostic', 'Client Annexe', 'Numéro RFC', 'Début Période ERP'],
+            ascending=[True, True, True, True, True, True, True]
         )
 
         # ======================================================================
