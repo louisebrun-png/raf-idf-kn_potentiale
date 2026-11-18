@@ -5,7 +5,7 @@ Solution automatisée de rapprochement des abonnements fournisseurs, contrôle d
 ## 👥 Équipe Projet
 - **Direction de Mission & Architecture SI :** Louise Brun (Fondatrice Cabinet Potentiale)
 - **Recette & Contrôle Technique ERP :** Noémie (Assistante Technique ERP)
-- **Préparation Sources & Piste d'Audit :** Angy (Assistante Administrative)
+  
 
 ## 🔄 Processus de Traitement
 1. **Importation :** Chargement de la simulation ERP (`.xlsx`), de l'annexe fournisseur (`.xlsx` / `.csv`) et de la facture de contrôle (`.pdf`).
