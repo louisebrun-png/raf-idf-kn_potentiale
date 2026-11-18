@@ -90,7 +90,7 @@ def norm_txt(s):
     return re.sub(r'[^a-z0-9]', '', s)
 
 def extract_art_num(val):
-    """Normalise KN5012 ou 5012 vers le radical numérique '5012'."""
+    """Généralise l'équivalence KNxxxx <-> xxxx pour toutes les références numériques."""
     s = str(val or '').strip().upper()
     if s in ('', 'NAN', 'NONE'):
         return ''
@@ -98,14 +98,17 @@ def extract_art_num(val):
     return m.group(1) if m else s
 
 def to_mda_article(val):
-    """Convertit une référence fournisseur (ex: '5012' ou 'KN5012') vers le format ERP MDA ('KN5012')."""
+    """Convertit toute référence fournisseur (ex: 5012, 5541, 17300) vers le format ERP MDA (KN5012, KN5541, KN17300)."""
     s = str(val or '').strip().upper()
     if s in ('', 'NAN', 'NONE'):
         return ''
-    if s.startswith('KN'):
+    if re.fullmatch(r'KN\d+', s):
         return s
     if s.isdigit():
         return f"KN{s}"
+    m = re.search(r'(\d+)', s)
+    if m and not s.startswith('KN'):
+        return f"KN{m.group(1)}"
     return s
 
 def fmt_date_fr(val):
@@ -182,7 +185,7 @@ def classify_mismatch_diag(qt_annexe, deb_erp_str, deb_annexe_str):
     return 'Écart Prix / Quantité'
 
 def compute_article_correction(row):
-    """Détermine si le Code Article ERP doit être remplacé par le Code Article MDA (ex: KN2912 -> KN5070)."""
+    """Contrôle systématique de toutes les références KNxxxx vs xxxx."""
     art_erp = str(row.get('Code Article ERP', '')).strip().upper()
     ref_annexe = str(row.get('Réf. Produit Annexe', '')).strip().upper()
     diag = str(row.get('Diagnostic', '')).strip()
@@ -219,6 +222,7 @@ def build_single_tab_excel(df_export):
     fill_ok = PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid")
     fill_warn = PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid")
     fill_prorata = PatternFill(start_color="E0F2FE", end_color="E0F2FE", fill_type="solid")
+    fill_regul = PatternFill(start_color="F3E8FF", end_color="F3E8FF", fill_type="solid")
     fill_err = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
 
     thin = Side(style='thin', color='CBD5E1')
@@ -254,6 +258,8 @@ def build_single_tab_excel(df_export):
                     c.fill = fill_ok
                 elif 'Manquant' in diag_val:
                     c.fill = fill_err
+                elif 'Régularisation' in diag_val:
+                    c.fill = fill_regul
                 elif 'prorata' in diag_val:
                     c.fill = fill_prorata
                 else:
@@ -301,7 +307,7 @@ with st.sidebar:
 st.markdown("# 💼 Potentiale — Outil Métier RAF (Rapprochement Abonnements Fournisseurs)")
 st.markdown(
     "**Fournisseur : Koesio Networks** | Urbanisation SI : Audit Fiscal TVA [STD Standard 20%], "
-    "Pivot d'Alias Client & Référentiel Articles MDA (`KNxxxx`), Contrôle ADV Consolidé"
+    "Référentiel Articles MDA (`KNxxxx` = `xxxx`) & Isolement des Régularisations Hors M-1"
 )
 
 with st.expander("📌 Correspondance Dépôts ERP = Factures Fournisseur (Règle d'Urbanisation Potentiale)", expanded=True):
@@ -387,7 +393,7 @@ if file_sim and file_ssc and files_csv:
         sim_valid['Numero_RFC'] = sim_valid['Numero_RFC'].fillna('')
         sim_valid['Depot_Cible'] = sim_valid['Depot_Brut'].apply(normalize_depot_simple)
 
-        # Détection automatique du mois d'étude & formatage des périodes ERP
+        # Détection automatique du mois d'étude M et du mois précédent M-1
         sim_valid['Deb_Per'] = pd.to_datetime(sim_valid['Début période facturation'], errors='coerce')
         sim_valid['Fin_Per'] = pd.to_datetime(sim_valid['Fin période facturation'], errors='coerce') if 'Fin période facturation' in sim_valid.columns else pd.NaT
         sim_valid['Deb_ERP_Fmt'] = sim_valid['Deb_Per'].apply(fmt_date_fr)
@@ -398,24 +404,31 @@ if file_sim and file_ssc and files_csv:
         if not valid_dates.empty:
             mode_date = valid_dates.dt.to_period('M').mode()[0]
             target_start = mode_date.to_timestamp()
+            prev_month_start = (mode_date - 1).to_timestamp()
             mois_detecte = f"{target_start.month:02d}/{target_start.year}"
+            mois_m1_label = f"{prev_month_start.month:02d}/{prev_month_start.year}"
         else:
             target_start = pd.Timestamp.today().replace(day=1)
+            prev_month_start = (target_start - pd.DateOffset(months=1))
             mois_detecte = f"{target_start.month:02d}/{target_start.year}"
+            mois_m1_label = f"{prev_month_start.month:02d}/{prev_month_start.year}"
 
+        # Classification temporelle : M (Mois d'étude), M-1 (Prorata admis), < M-1 (Régularisation antérieure à saisir sur facture)
         def check_temporalite(dt):
             if pd.isna(dt):
                 return 'Date manquante'
             if dt.year == target_start.year and dt.month == target_start.month:
-                return 'Cycle Conforme'
-            if dt < target_start:
-                return 'Régularisation Échue'
+                return 'Mois Courant (M)'
+            if dt.year == prev_month_start.year and dt.month == prev_month_start.month:
+                return 'Mois Précédent (M-1)'
+            if dt < prev_month_start:
+                return 'Régul. Antérieure (< M-1)'
             return 'Facturation Anticipée'
 
         sim_valid['Statut_Temporel'] = sim_valid['Deb_Per'].apply(check_temporalite)
-        nb_conformes = (sim_valid['Statut_Temporel'] == 'Cycle Conforme').sum()
-        nb_echues = (sim_valid['Statut_Temporel'] == 'Régularisation Échue').sum()
-        nb_anticipees = (sim_valid['Statut_Temporel'] == 'Facturation Anticipée').sum()
+        nb_m = (sim_valid['Statut_Temporel'] == 'Mois Courant (M)').sum()
+        nb_m1 = (sim_valid['Statut_Temporel'] == 'Mois Précédent (M-1)').sum()
+        nb_hors_m1 = (sim_valid['Statut_Temporel'] == 'Régul. Antérieure (< M-1)').sum()
         nb_retards = df_sim['Anomalie'].notna().sum() if 'Anomalie' in df_sim.columns else 0
 
         # --- 3. CHARGEMENT DES ANNEXES CSV FOURNISSEUR ---
@@ -444,8 +457,12 @@ if file_sim and file_ssc and files_csv:
         f_conso = f_rec[is_conso_mask].copy()
         f_abo = f_rec[~is_conso_mask].copy()
 
-        # --- 4. MOTEUR DE RÉCONCILIATION CONSOLIDÉ (KN5012 == 5012 + ALIAS CLIENT + MDA) ---
-        sim_rec = sim_valid[sim_valid['Depot_Cible'] != 'AF-KN-FAS'].copy()
+        # --- 4. ISOLEMENT DES RÉGULARISATIONS HORS M-1 (< M-1) ---
+        sim_all_rec = sim_valid[sim_valid['Depot_Cible'] != 'AF-KN-FAS'].copy()
+        sim_hors_m1 = sim_all_rec[sim_all_rec['Statut_Temporel'] == 'Régul. Antérieure (< M-1)'].copy()
+        sim_rec = sim_all_rec[sim_all_rec['Statut_Temporel'] != 'Régul. Antérieure (< M-1)'].copy()
+
+        # --- 5. MOTEUR DE RÉCONCILIATION CONSOLIDÉ (SUR PÉRIMÈTRE M & M-1) ---
         sim_rec['Tech_ID'] = sim_rec.apply(get_erp_tech_id, axis=1)
         sim_rec['Art_Num'] = sim_rec['Code Article'].apply(extract_art_num)
         sim_rec['Prod_Lib'] = sim_rec['Libellé RFC'].apply(lambda s: str(s).split('//')[0].strip())
@@ -453,7 +470,6 @@ if file_sim and file_ssc and files_csv:
         sim_rec['Prod_Norm'] = sim_rec['Prod_Lib'].apply(norm_txt)
 
         f_abo['Tech_ID'] = f_abo['Matricule fournisseur'].fillna('').astype(str).str.replace('.0', '', regex=False).str.strip()
-        # Normalisation bidirectionnelle KN5012 <-> 5012
         f_abo['Art_Num'] = f_abo['Réf. produit'].apply(extract_art_num)
         f_abo['Client_Norm'] = f_abo['Client final'].apply(norm_txt)
         f_abo['Prod_Norm'] = f_abo['Libellé produit'].apply(norm_txt)
@@ -540,7 +556,7 @@ if file_sim and file_ssc and files_csv:
                         f_abo.at[fi, 'Pass_RAF'] = 'P1b'
                         break
 
-            # Passe 2 : Alias Client + Code Article Numérique (KN5012 == 5012) + Période (Mois)
+            # Passe 2 : Alias Client + Code Article Numérique (KNxxxx == xxxx) + Période (Mois)
             s_rem = [si for si in s_idx if sim_rec.at[si, 'Pass_RAF'] == '' and sim_rec.at[si, 'Art_Num'] not in ('', '2912')]
             f_rem_cam = {}
             for fi in f_idx:
@@ -632,7 +648,7 @@ if file_sim and file_ssc and files_csv:
                 for fi in matched_fis:
                     f_abo.at[fi, 'Pass_RAF'] = 'P3'
 
-        # Construction du tableau unique consolidé (avec Périodes, Diagnostic et Code Article à Corriger MDA)
+        # Construction du tableau unique consolidé (M & M-1 + Régularisations hors M-1 + Manquants ERP)
         df_part_erp = pd.DataFrame({
             'Code Dépôt (Origine Facture)': sim_rec['Depot_Cible'],
             'Facture Associée': sim_rec['Depot_Cible'].map({
@@ -666,6 +682,41 @@ if file_sim and file_ssc and files_csv:
             'Diagnostic': sim_rec['Diagnostic']
         })
 
+        # Lignes de régularisation antérieures (< M-1) isolées avec un Diagnostic explicite
+        sim_hors_m1['Tech_ID'] = sim_hors_m1.apply(get_erp_tech_id, axis=1)
+        df_part_hors_m1 = pd.DataFrame({
+            'Code Dépôt (Origine Facture)': sim_hors_m1['Depot_Cible'],
+            'Facture Associée': sim_hors_m1['Depot_Cible'].map({
+                'AF-KN-Ope': 'Facture Opérateur',
+                'AF-KN-MOB': 'Facture Mobile',
+                'AF-KN-Heberg': 'Facture Hébergement'
+            }),
+            'Chargé Factu': sim_hors_m1['Charge_Factu'],
+            'Code Client ERP': sim_hors_m1['Code client'].fillna(''),
+            'Code Client Annexe': '',
+            'Client ERP': sim_hors_m1['Client'].fillna(''),
+            'Client Annexe': '',
+            'Numéro SSC': sim_hors_m1['Code SSC'].fillna(''),
+            'Numéro RFC': sim_hors_m1['Numero_RFC'],
+            'Code Article ERP': sim_hors_m1['Code Article'].fillna(''),
+            'Réf. Produit Annexe': '',
+            'Libellé RFC': sim_hors_m1['Libellé RFC'].fillna(''),
+            'Libellé Annexe': '',
+            'Identifiant Technique': sim_hors_m1['Tech_ID'],
+            'Début Période ERP': sim_hors_m1['Deb_ERP_Fmt'],
+            'Fin Période ERP': sim_hors_m1['Fin_ERP_Fmt'],
+            'Début Période Annexe': '',
+            'Fin Période Annexe': '',
+            'Qté ERP': sim_hors_m1['Quantite'],
+            'Qté Annexe': 0.0,
+            'P.U. ERP HT': sim_hors_m1['Prix Unitaire'],
+            'P.U. Annexe HT': 0.0,
+            'Montant ERP HT': sim_hors_m1['Montant HT'],
+            'Montant Annexe HT': 0.0,
+            'Écart HT (+ / -)': sim_hors_m1['Montant HT'],
+            'Diagnostic': f'Régularisation hors {mois_m1_label} (À saisir sur facture)'
+        })
+
         f_unmatched = f_abo[f_abo['Pass_RAF'] == ''].copy()
         df_part_fourn = pd.DataFrame({
             'Code Dépôt (Origine Facture)': f_unmatched['Depot_Fourn'],
@@ -696,7 +747,7 @@ if file_sim and file_ssc and files_csv:
             'Diagnostic': 'Manquant erp'
         })
 
-        df_conso_unique = pd.concat([df_part_erp, df_part_fourn], ignore_index=True)
+        df_conso_unique = pd.concat([df_part_erp, df_part_hors_m1, df_part_fourn], ignore_index=True)
         df_conso_unique['Code Article à Corriger (MDA)'] = df_conso_unique.apply(compute_article_correction, axis=1)
 
         df_conso_unique = df_conso_unique.sort_values(
@@ -746,33 +797,39 @@ if file_sim and file_ssc and files_csv:
         # ONGLET 2 : ABONNEMENTS RÉCURRENTS HT
         # ----------------------------------------------------------------------
         with tab2:
-            st.markdown(f"## ⏳ Audit de Temporalité ERP (Mois détecté : {mois_detecte})")
+            st.markdown(f"## ⏳ Audit de Temporalité ERP (Clôture {mois_detecte} — Prorata {mois_m1_label} Admis)")
             t1, t2, t3, t4 = st.columns(4)
-            t1.metric("🟢 Cycles Conformes", f"{nb_conformes} lignes")
-            t2.metric("🔵 Régularisations Échues", f"{nb_echues} lignes")
-            t3.metric("ℹ️ Facturations Anticipées", f"{nb_anticipees} lignes")
+            t1.metric(f"🟢 Mois Courant ({mois_detecte})", f"{nb_m} lignes")
+            t2.metric(f"🔵 Prorata M-1 ({mois_m1_label})", f"{nb_m1} lignes")
+            t3.metric(f"🟣 Régul. Hors M-1 (< {mois_m1_label})", f"{nb_hors_m1} lignes")
             t4.metric("🚨 Retards / Anomalies Dates", f"{nb_retards} lignes")
 
             st.markdown("---")
-            st.markdown("## 🧮 Synthèse Macro-Financière HT (Abonnements Récurrents Hors Consommations)")
+            st.markdown(f"## 🧮 Synthèse Macro-Financière HT (Périmètre {mois_detecte} & {mois_m1_label} Hors Consommations)")
 
-            tot_sim_ht = sim_rec['Montant HT'].sum()
+            tot_sim_perimetre_ht = sim_rec['Montant HT'].sum()
+            tot_hors_m1_ht = sim_hors_m1['Montant HT'].sum()
             tot_fourn_facture_ht = f_abo['Total H.T.'].sum()
-            ecart_net_global = tot_sim_ht - tot_fourn_facture_ht
+            ecart_net_global = tot_sim_perimetre_ht - tot_fourn_facture_ht
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total Simulation Artis (Achats)", f"{tot_sim_ht:,.2f} €")
-            m2.metric("Total Facturé Fournisseur (Hors Conso)", f"{tot_fourn_facture_ht:,.2f} €")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(f"Simulation Artis ({mois_detecte} + {mois_m1_label})", f"{tot_sim_perimetre_ht:,.2f} €")
+            m2.metric("Facturé Fournisseur (Hors Conso)", f"{tot_fourn_facture_ht:,.2f} €")
             m3.metric(
-                "Écart Net Global HT (+ / -)",
+                "Écart Net Récurrent (+ / -)",
                 format_ecart_signe(ecart_net_global),
                 delta="🚨 Attention (> 500 €)" if abs(ecart_net_global) > SEUIL_ALERTE_HT else "✅ Dans le seuil",
                 delta_color="inverse" if abs(ecart_net_global) > SEUIL_ALERTE_HT else "normal"
             )
+            m4.metric(
+                f"Régul. Hors {mois_m1_label} (À Saisir Facture)",
+                f"{tot_hors_m1_ht:,.2f} €",
+                delta=f"{nb_hors_m1} lignes non anticipables"
+            )
 
             if abs(ecart_net_global) > SEUIL_ALERTE_HT:
                 st.warning(
-                    f"🚨 **Attention (Écart > 500 €) :** L'écart net global atteint **{format_ecart_signe(ecart_net_global)} HT** "
+                    f"🚨 **Attention (Écart > 500 €) :** L'écart net sur le périmètre courant ({mois_detecte} & {mois_m1_label}) atteint **{format_ecart_signe(ecart_net_global)} HT** "
                     "(un signe **`+`** indique un surplus de lignes actives dans l'ERP — résiliations d'achats à passer ; "
                     "un signe **`-`** indique des prestations facturées absentes de l'ERP)."
                 )
@@ -785,45 +842,34 @@ if file_sim and file_ssc and files_csv:
                 ('AF-KN-Heberg', 'Facture Abonnements Hébergement')
             ]:
                 s_d = sim_rec[sim_rec['Depot_Cible'] == dep]
+                s_h = sim_hors_m1[sim_hors_m1['Depot_Cible'] == dep]
                 f_d = f_abo[f_abo['Depot_Fourn'] == dep]
                 sim_m = s_d['Montant HT'].sum()
+                hors_m1_m = s_h['Montant HT'].sum()
                 fourn_m = f_d['Total H.T.'].sum()
                 ecart_m = sim_m - fourn_m
                 alerte_txt = "🚨 ATTENTION (> 500 €)" if abs(ecart_m) > SEUIL_ALERTE_HT else "✅ OK (< 500 €)"
                 rows_dep.append({
                     'Code Dépôt': dep,
                     'Facture Associée': fact_nom,
-                    'Total Simulation ERP HT': round(sim_m, 2),
-                    'Total Facture Fournisseur HT': round(fourn_m, 2),
+                    f'Simulation ({mois_detecte}+{mois_m1_label}) HT': round(sim_m, 2),
+                    'Facture Fournisseur HT': round(fourn_m, 2),
                     'Écart Net (+ / -)': format_ecart_signe(ecart_m),
+                    f'Régul. Hors {mois_m1_label} (À Saisir)': round(hors_m1_m, 2),
                     'Contrôle Seuil 500 €': alerte_txt
                 })
             df_comp_dep = pd.DataFrame(rows_dep)
             st.dataframe(df_comp_dep, use_container_width=True, hide_index=True)
 
             st.markdown("---")
-            st.markdown("### 🔎 Table Consolidée de Contrôle & Diagnostic ADV (Tous Dépôts)")
-
-            all_diags = ['Conforme', 'Manquant annexe fournisseur', 'Manquant erp', 'Problème de prorata et/ou de prix', 'Écart Prix / Quantité']
-            col_f1, col_f2 = st.columns(2)
-            with col_f1:
-                filtre_diag = st.multiselect(
-                    "Filtrer par Diagnostic :",
-                    options=all_diags,
-                    default=['Manquant annexe fournisseur', 'Manquant erp', 'Problème de prorata et/ou de prix', 'Écart Prix / Quantité']
-                )
-            with col_f2:
-                filtre_dep = st.multiselect(
-                    "Filtrer par Code Dépôt :",
-                    options=['AF-KN-Ope', 'AF-KN-MOB', 'AF-KN-Heberg'],
-                    default=['AF-KN-Ope', 'AF-KN-MOB', 'AF-KN-Heberg']
-                )
-
-            df_vue = df_conso_unique[
-                df_conso_unique['Diagnostic'].isin(filtre_diag) &
-                df_conso_unique['Code Dépôt (Origine Facture)'].isin(filtre_dep)
-            ]
-            st.dataframe(df_vue, use_container_width=True, hide_index=True)
+            st.markdown("### 📊 Bilan Volumétrique du Rapprochement (Prêt à Exploiter dans Excel)")
+            diag_counts = df_conso_unique.groupby('Diagnostic', as_index=False).agg(
+                Nombre_Lignes=('Diagnostic', 'count'),
+                Montant_ERP_HT=('Montant ERP HT', 'sum'),
+                Montant_Annexe_HT=('Montant Annexe HT', 'sum'),
+                Ecart_HT=('Écart HT (+ / -)', 'sum')
+            )
+            st.dataframe(diag_counts, use_container_width=True, hide_index=True)
 
         # ----------------------------------------------------------------------
         # ONGLET 3 : FRAIS PONCTUELS PAR DÉPÔT (FAS)
